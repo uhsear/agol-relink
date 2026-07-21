@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Run output: contains item ids, titles, owners, and full service URLs from
+# whatever org the tool was pointed at. Never commit these.
+agol_urlswap_*/
+*/backups/
+changes.csv
+run.log
+updated_ids.txt
