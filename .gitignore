@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 venv/
 
+# The original pre-rewrite script. Kept locally for reference, never published.
+AGOL replace url script 1.txt
+
 # Run output: contains item ids, titles, owners, and full service URLs from
 # whatever org the tool was pointed at. Never commit these.
 agol_urlswap_*/

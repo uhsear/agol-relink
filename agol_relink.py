@@ -213,7 +213,7 @@ def succeeded(resp: Any) -> bool:
     """Did an AGOL write actually take?
 
     The two APIs we call disagree on shape. Item.update() returns a bool.
-    ResourceManager.update() returns the raw server dict -- which on failure is
+    ResourceManager.update() returns the raw server dict. On failure that is
     {"error": {...}}, a TRUTHY value. A plain `if resp:` therefore reports
     success for every failed resource write.
     """
@@ -246,7 +246,7 @@ def with_retry(fn, *a, what: str = "call", tries: int = RETRY_TRIES, **kw):
             if not transient or attempt == tries:
                 raise
             wait = min(RETRY_MAX_WAIT, 2 ** attempt) + random.uniform(0, 1)
-            log.warning("%s failed (attempt %d/%d): %s -- retrying in %.1fs",
+            log.warning("%s failed (attempt %d/%d): %s. Retrying in %.1fs",
                         what, attempt, tries, msg[:200], wait)
             time.sleep(wait)
 
@@ -297,7 +297,7 @@ def iter_items(gis, item_types: list[str], extra_query: str = "",
                if total_reported > 10000 else
                "private items owned by other users are not discoverable via "
                "search, even for an admin")
-        log.warning("enumerated %d of %s reported items -- some content was "
+        log.warning("enumerated %d of %s reported items. Some content was "
                     "not returned (%s)", len(seen), total_reported, why)
 
 
@@ -326,7 +326,7 @@ def fetch_data(item) -> Any:
     data = with_retry(item.get_data, what=f"get_data {item.id}")
     if data:
         return data
-    # get_data returned {} / None / b'' -- confirm that is genuinely the case
+    # get_data returned {} / None / b''. Confirm that is genuinely the case
     # rather than a swallowed error, by asking the sharing API directly.
     gis = item._gis
     url = f"{gis._portal.resturl}content/items/{item.id}/data"
@@ -362,7 +362,7 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
     if data:
         hits = walk_replace(data, old, new, opts)
 
-    # /data is only half the story for draft-bearing types -- see the docstring
+    # /data is only half the story for draft-bearing types. See the docstring
     # on process_resources.
     res_hits: list[Hit] = []
     if scan_resources:
@@ -372,7 +372,7 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
             base.status, base.error = "failed", rerr
             base.hits = hits + res_hits
             return base
-        # Report binaries whenever the item changed at all -- a draft-only edit
+        # Report binaries whenever the item changed at all. A draft-only edit
         # (resources matched, /data did not) still needs the manual follow-up.
         if opaque and (hits or res_hits):
             base.opaque = opaque
@@ -389,7 +389,7 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
 
     if hits:
         # Backup before /data is touched. (Resources, if any, were written
-        # earlier -- each took its own backup first.)
+        # earlier, each having taken its own backup first.)
         (backup_dir / f"{item.id}.json").write_text(original, encoding="utf-8")
         try:
             # update() returns False on a server-side refusal WITHOUT raising --
@@ -398,7 +398,7 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
             resp = with_retry(item.update, data=data, what=f"update {item.id}")
             if not succeeded(resp):
                 base.status = "failed"
-                base.error = f"server refused the write -- {err_text(resp)}"
+                base.error = f"server refused the write: {err_text(resp)}"
                 return base
         except Exception as e:
             base.status, base.error = "failed", f"update: {e}"
@@ -415,7 +415,7 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
     This is not optional polish. For StoryMaps and Experience Builder, /data
     holds the PUBLISHED copy while the working draft lives in a resource
     (draft_<ts>.json, config/config.json). Patch only /data and the next time
-    an author hits Publish, the old URL comes straight back -- the tool will
+    an author hits Publish, the old URL comes straight back, and the tool will
     have reported success for a change that silently reverts weeks later.
 
     Returns (hits, opaque_resource_names, error).
@@ -475,7 +475,7 @@ def process_item_url(item, old: str, new: str, opts: MatchOpts,
                      apply: bool) -> Result | None:
     """Rewrite the item's own top-level `url` property (service items).
 
-    This is a different API call than update(data=...) -- the registered URL of
+    This is a different API call than update(data=...). The registered URL of
     a Feature/Map Service item lives on the item, not in its data.
     """
     u = getattr(item, "url", None)
@@ -493,7 +493,7 @@ def process_item_url(item, old: str, new: str, opts: MatchOpts,
         ok = succeeded(resp)
         r.status = "updated" if ok else "failed"
         if not ok:
-            r.error = f"server refused the write -- {err_text(resp)}"
+            r.error = f"server refused the write: {err_text(resp)}"
     except Exception as e:
         r.status, r.error = "failed", f"update url: {e}"
     return r
@@ -611,7 +611,7 @@ def self_test() -> int:
     # the real hazard this guards: a bare host sweeps in non-service paths
     assert match_prefix("https://gis.example.org/portal",
                         "https://gis.example.org", o) >= 0, \
-        "bare host does match /portal -- which is exactly why it warns"
+        "bare host matches /portal, which is why it warns"
 
     # --- validate_urls rejects the inputs that would cause mass damage ---
     def rejects(a, b):
@@ -638,7 +638,7 @@ def self_test() -> int:
     doubled = rewrite(host + "/x", match_prefix(host + "/x", host, o), host + "/arcgis")
     assert doubled == host + "/arcgis/x"
     assert match_prefix(doubled, host, o) >= 0, \
-        "the rewritten url still matches old -- this is why it is rejected"
+        "rewritten url still matches old, hence the rejection"
 
     print("self-test: all assertions passed")
     return 0
@@ -658,7 +658,7 @@ def setup_logging(out_dir: Path, verbose: bool) -> None:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # urllib3 logs every request line at DEBUG, query string included -- and
+    # urllib3 logs every request line at DEBUG, query string included, and
     # arcgis passes the auth token as a GET parameter. Without this cap, a live
     # token lands in run.log, which is precisely the file someone pastes into a
     # forum thread when asking why their run failed.
@@ -881,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
                 with updated_ids.open("a", encoding="utf-8") as fh:
                     fh.write(item.id + "\n")
         elif r.status in ("failed", "skipped"):
-            log.warning("[%d] %-8s %s  %s  -- %s", n, r.status, item.id,
+            log.warning("[%d] %-8s %s  %s  : %s", n, r.status, item.id,
                         (item.title or "")[:60], r.error)
         else:
             log.debug("[%d] clean    %s  %s", n, item.id, (item.title or "")[:60])
@@ -912,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
     if opaque_items:
         log.warning("")
         log.warning("%d changed item(s) also carry binary resources this tool "
-                    "cannot read. URLs inside them are NOT rewritten -- check "
+                    "cannot read. URLs inside them are NOT rewritten. Check "
                     "them by hand:", len(opaque_items))
         for iid, names in opaque_items[:15]:
             log.warning("  %s  %s", iid, ", ".join(names[:5]))
@@ -920,10 +920,10 @@ def main(argv: list[str] | None = None) -> int:
             log.warning("  ... %d more (see run.log)", len(opaque_items) - 15)
     if not apply and total_urls:
         log.info("")
-        log.info("DRY-RUN -- nothing was written. Review %s, then re-run with "
+        log.info("DRY-RUN. Nothing was written. Review %s, then re-run with "
                  "--apply to commit.", csv_path.name)
     if counts.get("failed"):
-        log.warning("%d items FAILED -- see the report", counts["failed"])
+        log.warning("%d items FAILED, see the report", counts["failed"])
         return 2
     return 0
 
