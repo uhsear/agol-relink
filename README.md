@@ -154,10 +154,14 @@ The write path was checked separately against a disposable item on a live org,
 verifying server-side persistence, backup, and rollback, then dry-run over 2000+
 real items.
 
-## Issues
+## Contributing
 
-Open an issue on GitHub.
+Open an issue or pull request on GitHub.
+
+## Author
+
+Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 
 ## License
 
-MIT. Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
+MIT.

@@ -809,7 +809,17 @@ def main(argv: list[str] | None = None) -> int:
             done = {ln.strip() for ln in rp.read_text().splitlines() if ln.strip()}
             log.info("resume    : skipping %d already-updated items", len(done))
 
-    from arcgis.gis import GIS  # imported late so --self-test needs no arcgis
+    try:
+        # Imported late so --self-test needs no arcgis.
+        from arcgis.gis import GIS
+    except ModuleNotFoundError:
+        sys.exit(
+            "The arcgis package was not found. Install it with\n"
+            "  pip install arcgis\n"
+            "or run this with the Python that ships with ArcGIS Pro:\n"
+            r'  "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" '
+            "agol_relink.py"
+        )
     log.info("connecting to %s as %s ...", org, user)
     # NOTE: no verify_cert=False. Disabling TLS verification would POST these
     # credentials over an unvalidated connection. If you target a Portal with a
