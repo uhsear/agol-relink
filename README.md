@@ -165,3 +165,10 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT.
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [cimscan](https://github.com/uhsear/cimscan) - the same hunt for a dead service URL, but across .aprx and .lyrx files on disk
+- [sightline](https://github.com/uhsear/sightline) - what a viewer can actually see after the relink
