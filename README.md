@@ -155,7 +155,7 @@ the enumerated count falls short of the server's reported total, the run warns.
 
 ## Testing
 
-`--self-test` runs 67 assertions offline covering URL shapes, the boundary rule,
+`--self-test` runs 59 assertions offline covering URL shapes, the boundary rule,
 case and scheme options, a recursive walk over nested group layers, idempotence,
 and input validation.
 
