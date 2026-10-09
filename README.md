@@ -22,6 +22,15 @@ ArcGIS Pro already ships it:
 Otherwise `conda install -c esri arcgis` or `pip install arcgis`. Then download
 `agol_relink.py`. There is nothing to build.
 
+**Scheduled tasks need a Python without ArcPy.** The `arcgis` package tries to
+import ArcPy when it loads. Under a non-interactive scheduled task, the ArcGIS
+Pro licence may not be initialised. The import then fails with "The Product
+License has not been initialized", before the tool reaches your portal. The
+ArcGIS Pro Python above has ArcPy, so it has this problem. For a scheduled run,
+use a Python that has `arcgis` installed but not `arcpy`. Setting
+`ARCGIS_IO_ENGINE` does not help, because `arcgis` checks for ArcPy before it
+reads that variable.
+
 ## Use
 
 ```bash
@@ -146,7 +155,7 @@ the enumerated count falls short of the server's reported total, the run warns.
 
 ## Testing
 
-`--self-test` runs 50 assertions offline covering URL shapes, the boundary rule,
+`--self-test` runs 67 assertions offline covering URL shapes, the boundary rule,
 case and scheme options, a recursive walk over nested group layers, idempotence,
 and input validation.
 

@@ -22,8 +22,10 @@ Run --self-test to exercise the matcher without touching a server.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import getpass
+import io
 import json
 import logging
 import os
@@ -640,6 +642,16 @@ def self_test() -> int:
     assert match_prefix(doubled, host, o) >= 0, \
         "rewritten url still matches old, hence the rejection"
 
+    # --apply is the write flag. A unique prefix of it must never reach the write path.
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            build_parser().parse_args(["--ap"])
+        except SystemExit as e:
+            refused = e.code == 2
+        else:
+            refused = False
+    assert refused, "unique prefix --ap must be refused, not read as --apply"  # <-- pinned defect
+
     print("self-test: all assertions passed")
     return 0
 
@@ -723,10 +735,11 @@ def breadth_warning(old: str) -> str:
             "than one service.")
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Bulk-replace REST service URLs in AGOL/Portal content. "
-                    "Dry-run unless --apply is given.")
+                    "Dry-run unless --apply is given.",
+        allow_abbrev=False)
     p.add_argument("--self-test", action="store_true",
                    help="run offline assertions on the matcher and exit")
     # Defaults come from the CONFIGURATION block; env vars beat it; flags win.
@@ -760,7 +773,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--resume", default="",
                    help="path to a previous run's out-dir; skip items already updated")
     p.add_argument("-v", "--verbose", action="store_true")
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     if args.self_test:
         return self_test()
