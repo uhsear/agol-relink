@@ -5,8 +5,8 @@ Dry-run by default. Nothing is written to the org unless you pass --apply.
 
 Why this exists in this shape
 -----------------------------
-Service URLs hide in far more places than operationalLayers[].url. A scan of a
-real 336-web-map org found them at 13 distinct JSON paths, including two levels
+Service URLs hide in far more places than operationalLayers[].url. An early
+scan of one real org of a few hundred web maps found them at 13 distinct JSON paths, including two levels
 of GroupLayer nesting, baseMap styleUrl, presentation.slides[] basemaps, and
 renderer symbol image URLs. Rather than maintain an allowlist of paths that
 Esri keeps extending, this walks the whole item-data tree and rewrites any
@@ -26,6 +26,7 @@ import argparse
 import builtins
 import contextlib
 import csv
+import email.parser
 import getpass
 import http.server
 import io
@@ -409,6 +410,19 @@ class Result:
     opaque: list[str] = field(default_factory=list)  # binary resources we cannot read
 
 
+def _refuse_error_body(doc: Any, what: str) -> Any:
+    """Raise when a 200 response carries an error body instead of content.
+
+    The raw fetch uses try_json=False, so the library does not look at the body.
+    A 403 or 498 then arrives as {"error": {...}}, which would be read as an item
+    with nothing to rewrite. No item or resource document has "error" as its
+    only key.
+    """
+    if isinstance(doc, dict) and set(doc) == {"error"}:
+        raise RuntimeError("%s request refused: %s" % (what, err_text(doc)))
+    return doc
+
+
 def fetch_data(item) -> Any:
     """Get item data, distinguishing 'empty' from 'fetch failed'.
 
@@ -432,10 +446,11 @@ def fetch_data(item) -> Any:
         if not resp:
             return {}
         try:
-            return json.loads(resp)
+            resp = json.loads(resp)
         except ValueError:
             raise RuntimeError("item data is not JSON (%d bytes)" % len(resp))
-    return resp or {}
+        return _refuse_error_body(resp, "item data")
+    return _refuse_error_body(resp, "item data") or {}
 
 
 def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
@@ -529,14 +544,16 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
             continue
         if not name.lower().endswith(".json"):
             continue
+        # A draft that cannot be read is a draft that may still hold the old
+        # URL. Report the item as failed rather than clean.
         try:
             doc = with_retry(item.resources.get, file=name, try_json=True,
                              what="resources.get %s/%s" % (item.id, name))
+            _refuse_error_body(doc, "resource")
         except Exception as e:
-            log.debug("  resource %s unreadable: %s", name, e)
-            continue
+            return hits, opaque, "resources.get %s: %s" % (name, e)
         if not isinstance(doc, (dict, list)):
-            continue
+            return hits, opaque, "resources.get %s: the resource is not JSON" % name
 
         original = json.dumps(doc, ensure_ascii=False)
         rhits = walk_replace(doc, old, new, opts, path="[resource:%s]" % name)
@@ -552,10 +569,14 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
 
         folder, _, leaf = name.rpartition("/")
         try:
-            resp = with_retry(item.resources.update, folder_name=folder or None,
-                              file_name=leaf,
-                              text=json.dumps(doc, ensure_ascii=False),
-                              what="resources.update %s/%s" % (item.id, name))
+            # Upload a file, never text=. AGOL HTML-sanitizes an updateResources
+            # text= body: it strips style= attributes and blanks image sources.
+            with tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / leaf
+                src.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+                resp = with_retry(item.resources.update, file=str(src),
+                                  folder_name=folder or None, file_name=leaf,
+                                  what="resources.update %s/%s" % (item.id, name))
             if not succeeded(resp):
                 return hits, opaque, "resources.update %s: %s" % (name, err_text(resp))
         except Exception as e:
@@ -680,6 +701,11 @@ class _RedactFilter(logging.Filter):
     def filter(self, record):
         record.msg = redact(record.getMessage())
         record.args = None
+        if record.exc_info:
+            # A traceback is formatted after the filters run, from exc_info.
+            # Format it here, blank the tokens, and drop exc_info.
+            record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
         return True
 
 
@@ -695,7 +721,8 @@ def setup_logging(out_dir: Path, verbose: bool) -> None:
     root.setLevel(logging.DEBUG)
 
     # urllib3 logs every request line at DEBUG, query string included, and
-    # arcgis passes the auth token as a GET parameter. Without this cap, a live
+    # arcgis can pass the auth token as a GET parameter (the legacy sign-in
+    # default in 2.4.2). Without this cap, a live
     # token lands in run.log, which is precisely the file someone pastes into a
     # forum thread when asking why their run failed. The redact filter below is
     # the second layer: it blanks token= values whatever level they arrive at.
@@ -985,6 +1012,12 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(out_dir, args.verbose)
     try:
         return run(args, org, user, pwd, old, new, apply, out_dir)
+    except Exception as e:  # a library error text can repeat the request url
+        log.error("aborted by an unexpected error: %s: %s. No changes.csv was "
+                  "written. Items already written are in updated_ids.txt: "
+                  "re-run with --resume %s", type(e).__name__, e, out_dir)
+        log.debug("traceback", exc_info=True)
+        return EXIT_REFUSED
     finally:
         teardown_logging()
 
@@ -1091,7 +1124,7 @@ class _StubOrg(object):
         key = params["fileName"]
         if "resourcesPrefix" in params:
             key = params["resourcesPrefix"] + "/" + key
-        item["resources"][key] = params["text"]
+        item["resources"][key] = params["file"]
         return 200, {"success": True, "itemId": iid}
 
 
@@ -1118,7 +1151,18 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         params = dict(urllib.parse.parse_qsl(parts.query))
         if method == "POST":
             size = int(self.headers.get("Content-Length") or 0)
-            params.update(urllib.parse.parse_qsl(self.rfile.read(size).decode("utf-8")))
+            body = self.rfile.read(size)
+            ctype = self.headers.get("Content-Type", "")
+            if ctype.startswith("multipart/form-data"):
+                msg = email.parser.BytesParser().parsebytes(
+                    b"Content-Type: " + ctype.encode("ascii") + b"\r\n\r\n" + body)
+                for part in msg.get_payload():
+                    field_name = part.get_param("name", header="content-disposition")
+                    params[field_name] = part.get_payload(decode=True).decode("utf-8")
+                    if part.get_filename():
+                        params["_filename"] = part.get_filename()
+            else:
+                params.update(urllib.parse.parse_qsl(body.decode("utf-8")))
         path = parts.path
         org.requests.append((method, path, params))
         if path.endswith("/generateToken"):
@@ -1151,17 +1195,29 @@ class _StubCon(object):
     def get(self, url, params, try_json=True):
         return self._send(url, params, None, try_json)
 
-    def post(self, url, params):
-        return self._send(url, {}, params, True)
+    def post(self, url, params, files=None):
+        return self._send(url, {}, params, True, files)
 
-    def _send(self, url, query, form, try_json):
+    def _send(self, url, query, form, try_json, files=None):
         query = dict(query)
         if self.token:
             query["token"] = self.token
         full = url + "?" + urllib.parse.urlencode(query)
         body = None if form is None else urllib.parse.urlencode(form).encode("ascii")
+        headers = {}
+        if files:
+            boundary = "stubboundary7731"
+            parts = [('Content-Disposition: form-data; name="%s"' % k, str(v).encode("utf-8"))
+                     for k, v in form.items()]
+            parts += [('Content-Disposition: form-data; name="file"; filename="%s"' % leaf,
+                       data) for leaf, data in files]
+            body = b"".join(b"--" + boundary.encode("ascii") + b"\r\n" + head.encode("ascii")
+                            + b"\r\n\r\n" + payload + b"\r\n" for head, payload in parts)
+            body += b"--" + boundary.encode("ascii") + b"--\r\n"
+            headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
         try:
-            with self.opener.open(urllib.request.Request(full, data=body)) as resp:
+            with self.opener.open(urllib.request.Request(full, data=body,
+                                                         headers=headers)) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             exc.close()
@@ -1189,14 +1245,16 @@ class _StubResources(object):
         except ValueError:
             return raw
 
-    def update(self, folder_name=None, file_name=None, text=None):
+    def update(self, file, folder_name=None, file_name=None):
         gis = self._item._gis
-        params = {"f": "json", "fileName": file_name, "text": text}
+        params = {"f": "json", "fileName": file_name}
         if folder_name is not None:
             params["resourcesPrefix"] = folder_name
         url = "%scontent/users/%s/items/%s/updateResources" % (
             gis._portal.resturl, self._item.owner, self._item.id)
-        return gis._con.post(url, params)
+        with open(file, "rb") as fh:
+            files = [(os.path.basename(file), fh.read())]
+        return gis._con.post(url, params, files=files)
 
 
 class _StubItem(object):
@@ -1214,9 +1272,12 @@ class _StubItem(object):
         url = "%scontent/items/%s/data" % (self._gis._portal.resturl, self.id)
         try:
             raw = self._gis._con.get(url, {"f": "json"}, try_json=False)
-            return json.loads(raw) if raw else None
+            doc = json.loads(raw) if raw else None
         except Exception:
             return {}
+        if isinstance(doc, dict) and "error" in doc:
+            return {}
+        return doc
 
     def update(self, item_properties=None, data=None):
         params = {"f": "json"}
@@ -1326,7 +1387,13 @@ class _Cli(object):
         os.environ.update(env or {})
         saved_mods = dict((k, sys.modules.get(k)) for k in ("arcgis", "arcgis.gis"))
         saved_input, saved_getpass = builtins.input, getpass.getpass
-        builtins.input = lambda prompt="": answers.pop(0)
+
+        def fake_input(prompt=""):
+            if not answers:
+                raise EOFError("stdin is closed")
+            return answers.pop(0)
+
+        builtins.input = fake_input
         getpass.getpass = lambda prompt="": password
         for k in saved_mods:
             sys.modules.pop(k, None)
@@ -1635,6 +1702,8 @@ def _selftest_csv(h):
           "redact blanks access_token")
     check(redact("TOKEN=abc") == "TOKEN=[redacted]" and redact("mytoken=abc") == "mytoken=abc",
           "redact matches a whole parameter name only")
+    check(redact("u?api_key=zzz&authToken=yyy") == "u?api_key=zzz&authToken=yyy",
+          "only token= and access_token= are blanked, other secret-like names are not")
     check(redact(7) == 7 and redact("no secrets here") == "no secrets here",
           "redact passes other values through")
     check(out_cell("a?token=SECRET")== "a?token=[redacted]" and out_cell("=a?token=SECRET") == "'=a?token=[redacted]",
@@ -1660,9 +1729,8 @@ def _scenario_dry_run(cli, h):
                     owner="+owner",
                     resources={"draft_1.json": json.dumps({"a": [{"url": _OLD + "/5"}]}),
                                "config/config.json": json.dumps({"url": _OLD + "/6"}),
-                               "bad.json": "not json at all", "thumb.png": "x",
-                               "notes.txt": "plain"},
-                    ghosts=["gone.json", ""]),
+                               "thumb.png": "x", "notes.txt": "plain"},
+                    ghosts=[""]),
         "m2": _item("Clean", {"keep": {"url": _OTHER}}),
         "m3": _item("Empty", None),
         "m4": _item("Number", None, raw="5"),
@@ -1693,6 +1761,8 @@ def _scenario_dry_run(cli, h):
     check(not any(row[0] == "m2" for row in rows[1:]), "a clean item gets no row")
     check("thumb.png" in r.out and "binary resources" in r.out,
           "the opaque resource is listed for manual follow-up")
+    check(not any("notes.txt" in c for row in rows for c in row) and "notes.txt" not in r.out,
+          "a text resource is neither scanned nor listed")
     check("DRY-RUN. Nothing was written" in r.out, "a dry run says nothing was written")
     check("[2] clean    m2  Clean" in r.out, "-v shows clean items")
     log_text = dict(_tree_text(out_dir))["run.log"]
@@ -1729,6 +1799,10 @@ def _scenario_apply(cli, h):
           "apply rewrites a root resource")
     check(not any(p.endswith("/items/a2/update") for (_m, p, _q) in cli.org.requests),
           "an item whose only match is a resource never has its /data written" + PIN)
+    uploads = [q for (_m, p, q) in cli.org.requests if p.endswith("/updateResources")]
+    check(len(uploads) == 3 and all("file" in q and "text" not in q for q in uploads)
+          and all(q["_filename"] == q["fileName"] for q in uploads),
+          "a resource is written as an uploaded file, never as text=" + PIN)
     ids = open(os.path.join(out_dir, "updated_ids.txt"), encoding="utf-8").read().split()
     check(ids == ["a1", "a2"], "updated_ids.txt lists the written items")
     backup = json.load(open(os.path.join(out_dir, "backups", "a1.json"), encoding="utf-8"))
@@ -1764,8 +1838,10 @@ def _scenario_apply(cli, h):
     item.update(data=json.load(open(str(backups / "a1.json"), encoding="utf-8")))
     for p in (backups / "resources" / "a1").glob("*"):
         folder, _, leaf = p.name.replace("__", "/").rpartition("/")
-        item.resources.update(folder_name=folder or None, file_name=leaf,
-                              text=p.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copyfile(str(p), str(Path(tmp) / leaf))
+            item.resources.update(file=str(Path(tmp) / leaf), folder_name=folder or None,
+                                  file_name=leaf)
     check(cli.org.items["a1"]["data"] == data_a
           and cli.org.items["a1"]["resources"]["config/config.json"] == json.dumps({"url": _OLD + "/6"})
           and cli.org.items["a1"]["resources"]["draft_9.json"] == json.dumps({"u": _OLD + "/7"}),
@@ -1784,11 +1860,18 @@ def _scenario_failures(cli, h):
         "f5": _item("Update raises", _webmap(_OLD + "/2")),
         "f6": _item("Retried", _webmap(_OLD + "/4")),
         "f7": _item("Res raises", {}, resources={"draft_1.json": json.dumps({"u": _OLD})}),
+        "f8": _item("Res listed, gone", {}, ghosts=["gone.json"]),
+        "f9": _item("Res not JSON", {}, resources={"bad.json": "not json at all"}),
+        "fa": _item("Res error body", {}, resources={"draft_1.json": json.dumps({"u": _OLD})}),
+        "fb": _item("Data error body", _webmap(_OLD + "/9")),
     })
     boom = (500, {"error": {"code": 500, "message": "boom"}})
+    denied = (200, {"error": {"code": 403, "message": "Not allowed."}})
     cli.org.faults = {"f4/resources": [boom], "f5/update": [boom],
                       "f6/data": [(503, {}), (429, {}), (503, {})],
-                      "f7/updateResources": [boom]}
+                      "f7/updateResources": [boom],
+                      "fa/resources/draft_1.json": [denied],
+                      "fb/data": [denied, denied]}
     sleeps = []
     real_sleep = time.sleep
     time.sleep = sleeps.append
@@ -1801,8 +1884,8 @@ def _scenario_failures(cli, h):
     check(r.code == 2, "failed items make the run exit 2, got %r" % (r.code,))
     rows = _read_csv(os.path.join(out_dir, "changes.csv"))
     err = dict((row[0], row[8]) for row in rows[1:] if row[4] == "failed")
-    check(sorted(err) == ["f1", "f2", "f3", "f4", "f5", "f7"],
-          "six items are reported failed, one per failure mode")
+    check(sorted(err) == ["f1", "f2", "f3", "f4", "f5", "f7", "f8", "f9", "fa", "fb"],
+          "ten items are reported failed, one per failure mode")
     check(err["f1"].startswith("fetch: item data is not JSON"),
           "get_data's swallowed error is found by the raw re-fetch" + PIN)
     check(err["f2"].startswith("server refused the write: "),
@@ -1813,6 +1896,14 @@ def _scenario_failures(cli, h):
     check(err["f5"].startswith("update: "), "an update that raises is a failure")
     check(err["f7"].startswith("resources.update draft_1.json: "),
           "a resource update that raises is a failure")
+    check(err["f8"].startswith("resources.get gone.json: 404 Server Error"),
+          "a listed resource that cannot be read fails the item, it is not skipped" + PIN)
+    check(err["f9"] == "resources.get bad.json: the resource is not JSON",
+          "a .json resource that is not JSON fails the item" + PIN)
+    check(err["fa"].startswith("resources.get draft_1.json: resource request refused: 403: Not allowed."),
+          "a resource read that answers 200 with an error body fails the item" + PIN)
+    check(err["fb"].startswith("fetch: item data request refused: 403: Not allowed."),
+          "an item data read that answers 200 with an error body is a failure, not clean" + PIN)
     check(cli.org.items["f6"]["data"]["operationalLayers"][0]["url"] == _NEW + "/4",
           "a 503 then a 429 are retried and the write lands")
     check(len(sleeps) == 2 and all(0 < s <= RETRY_MAX_WAIT + 1 for s in sleeps),
@@ -1820,7 +1911,31 @@ def _scenario_failures(cli, h):
     blob = r.out + r.err + "".join(t for _p, t in _tree_text(out_dir))
     check(_STUB_TOKEN not in blob and "[redacted]" in blob,
           "a library error that repeats the request url does not leak the token" + PIN)
-    check("6 items FAILED" in r.out, "the console says how many items failed")
+    check("10 items FAILED" in r.out, "the console says how many items failed")
+
+
+def _scenario_crash(cli, h):
+    """An uncaught error ends in one redacted line and exit 1, never a raw traceback."""
+    check = h.check
+    cli.org.items["s1"] = _item("S", _webmap(_OLD + "/0"))
+    cli.org.faults = {"search": [(503, {})] * RETRY_TRIES}
+    real_sleep = time.sleep
+    time.sleep = lambda seconds: None
+    try:
+        out_dir = cli.out_dir()
+        r = cli.run(cli.base(["--apply", "--yes"], out_dir=out_dir))
+    finally:
+        time.sleep = real_sleep
+    run_log = dict(_tree_text(out_dir))["run.log"]
+    check(r.code == EXIT_REFUSED and "aborted by an unexpected error: RuntimeError" in r.out,
+          "a search that keeps failing ends in one line and exit 1, got %r" % (r.code,))
+    check(_STUB_TOKEN not in r.out + r.err + run_log and "[redacted]" in r.out,
+          "the session token is in no traceback, console line or log after a crash" + PIN)
+    check(r.err == "" and "Traceback (most recent call last)" in run_log,
+          "the traceback goes to run.log, redacted, and not to the console")
+    check(not os.path.exists(os.path.join(out_dir, "changes.csv"))
+          and "--resume %s" % out_dir in r.out,
+          "a crash writes no changes.csv and the message names --resume")
 
 
 def _scenario_enumeration(cli, h):
@@ -2016,6 +2131,13 @@ def _scenario_cli(cli, h):
     check(same.code == 1 and "same" in same.msg, "bad urls are refused before any sign-in")
     arg = cli.run(["--ap"])
     check(arg.code == 2, "a write-flag prefix exits 2 through main as well" + PIN)
+    typo = cli.run(["--pass", "hunter2SECRET"])
+    check(typo.code == 2 and "unrecognized arguments: --pass hunter2SECRET" in typo.err,
+          "a misspelt --password is refused and argparse echoes the argument (a known limit)")
+    before = len(cli.org.writes())
+    closed = cli.run(cli.base(["--apply"]))
+    check(closed.code == 1 and "EOFError" in closed.out and len(cli.org.writes()) == before,
+          "a closed stdin at the APPLY prompt exits 1 and writes nothing")
     tidy = logging.getLogger().handlers
     check(tidy == [], "main closes its log handlers, nothing is left open")
     broad = cli.run(cli.base(old="https://127.0.0.1", new="https://new.example.net/x"))
@@ -2045,7 +2167,7 @@ def _selftest_io(h):
     tmp = tempfile.mkdtemp(prefix="agol_relink_selftest_")
     try:
         for name, scenario in (("dry", _scenario_dry_run), ("apply", _scenario_apply),
-                               ("failures", _scenario_failures),
+                               ("failures", _scenario_failures), ("crash", _scenario_crash),
                                ("enumeration", _scenario_enumeration),
                                ("item_url", _scenario_item_url),
                                ("volume", _scenario_volume), ("options", _scenario_options),
@@ -2156,6 +2278,8 @@ def _selftest_units(h, tmp):
     check(fetch_data(Item({}, b'{"u": 1}')) == {"u": 1}, "a bytes raw payload is decoded and parsed")
     check(fetch_data(Item({}, {"x": 1})) == {"x": 1} and fetch_data(Item({}, None)) == {},
           "a raw payload that is already parsed is returned, None becomes empty")
+    h.raises(lambda: fetch_data(Item({}, {"error": {"code": 403, "message": "no"}})),
+             "a parsed error body is refused, not read as empty data" + PIN, exc=RuntimeError)
     h.raises(lambda: fetch_data(Item({}, "<html>")), "an HTML raw payload is an error, not empty data",
              exc=RuntimeError)
 
