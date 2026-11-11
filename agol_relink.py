@@ -114,10 +114,11 @@ ANY_SCHEME = True     # False -> http:// and https:// are treated as different
 # back the next time an author hits Publish.
 SCAN_RESOURCES = True
 
-# Binary resources that can embed URLs but cannot be read as JSON. Items
-# carrying these are listed at the end of the run for manual follow-up.
-OPAQUE_RESOURCE_EXT = (".zip", ".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".gif",
-                       ".pdf", ".docx", ".sd", ".gdb")
+# Only .json resources are read. Any other resource (.zip, .xlsx, .txt, .html
+# ...) may hold the old URL and is not scanned, so its item is listed at the end
+# of the run and the run exits 3. Plain images are the exception: they are
+# neither read nor counted.
+IMAGE_RESOURCE_EXT = (".png", ".jpg", ".jpeg", ".gif")
 
 # --- reliability ----------------------------------------------------------
 RETRY_TRIES = 5        # attempts per AGOL call before giving up
@@ -407,7 +408,7 @@ class Result:
     status: str            # matched | updated | clean | skipped | failed
     hits: list[Hit] = field(default_factory=list)
     error: str = ""
-    opaque: list[str] = field(default_factory=list)  # binary resources we cannot read
+    unread: list[str] = field(default_factory=list)  # data or resources not scanned
 
 
 def _refuse_error_body(doc: Any, what: str) -> Any:
@@ -453,6 +454,54 @@ def fetch_data(item) -> Any:
     return _refuse_error_body(resp, "item data") or {}
 
 
+def list_resources(item) -> list:
+    """Every resource entry of an item, or an exception.
+
+    ResourceManager.list() in arcgis 2.4.2 reads resp.get('resources', []) from
+    the raw JSON, so a 200 answer that carries an error body comes back as an
+    empty list. That reads as an item with no drafts. This lists the resources
+    itself, refuses an error body, and follows nextStart. The Esri paging
+    parameters give num a default of 10 and a maximum of 100.
+    """
+    gis = item._gis
+    url = "%scontent/items/%s/resources" % (gis._portal.resturl, item.id)
+    entries: list = []
+    start = 1
+    while True:
+        raw = with_retry(gis._con.get, url, {"f": "json", "num": 100, "start": start},
+                         try_json=False, what="resources.list %s" % item.id)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        doc = json.loads(raw) if isinstance(raw, str) else raw
+        _refuse_error_body(doc, "resource list")
+        page = doc.get("resources") if isinstance(doc, dict) else None
+        if not isinstance(page, list):
+            raise RuntimeError("the resource list has no 'resources' array")
+        entries.extend(page)
+        nxt = doc.get("nextStart", -1)
+        if not isinstance(nxt, int) or nxt <= start:
+            return entries
+        start = nxt
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a backup that only its owner can read, where the OS allows it.
+
+    A backup is the item's original data, so it can hold a signed URL. The mode
+    applies on POSIX. Windows ignores it and uses the folder's ACL.
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def note_backup_tokens(item_id: str, text: str) -> None:
+    n = len(_TOKEN_RE.findall(text))
+    if n:
+        log.warning("backup of %s holds %d token= value(s) as the item stores "
+                    "them. Treat backups/ as secret.", item_id, n)
+
+
 def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
                  backup_dir: Path, scan_resources: bool = SCAN_RESOURCES) -> Result:
     base = Result(item.id, item.title or "", item.type, item.owner, "clean")
@@ -462,7 +511,9 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
         base.status, base.error = "failed", "fetch: %s" % e
         return base
     if not isinstance(data, (dict, list)):
-        base.status, base.error = "skipped", "data is %s" % type(data).__name__
+        kind = type(data).__name__
+        base.status, base.error = "skipped", "data is %s" % kind
+        base.unread = ["data (%s)" % kind]
         return base
 
     hits: list[Hit] = []
@@ -474,16 +525,15 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
     # on process_resources.
     res_hits: list[Hit] = []
     if scan_resources:
-        res_hits, opaque, rerr = process_resources(item, old, new, opts, apply,
+        res_hits, unread, rerr = process_resources(item, old, new, opts, apply,
                                                    backup_dir)
         if rerr:
             base.status, base.error = "failed", rerr
             base.hits = hits + res_hits
             return base
-        # Report binaries whenever the item changed at all. A draft-only edit
-        # (resources matched, /data did not) still needs the manual follow-up.
-        if opaque and (hits or res_hits):
-            base.opaque = opaque
+        # An unchanged item counts too: its only copy of the old URL may sit in
+        # a resource this tool does not read.
+        base.unread = unread
 
     base.hits = hits + res_hits
     if not base.hits:
@@ -498,7 +548,8 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
     if hits:
         # Backup before /data is touched. (Resources, if any, were written
         # earlier, each having taken its own backup first.)
-        (backup_dir / ("%s.json" % item.id)).write_text(original, encoding="utf-8")
+        write_private(backup_dir / ("%s.json" % item.id), original)
+        note_backup_tokens(item.id, original)
         try:
             # update() returns False on a server-side refusal WITHOUT raising --
             # e.g. an item you can read but not edit. Treating that as success is
@@ -526,23 +577,21 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
     an author hits Publish, the old URL comes straight back, and the tool will
     have reported success for a change that silently reverts weeks later.
 
-    Returns (hits, opaque_resource_names, error).
+    Returns (hits, names_of_resources_not_read, error).
     """
     hits: list[Hit] = []
     opaque: list[str] = []
     try:
-        listing = with_retry(item.resources.list, what="resources.list %s" % item.id)
+        listing = list_resources(item)
     except Exception as e:
         return hits, opaque, "resources.list: %s" % e
 
-    for entry in listing or []:
+    for entry in listing:
         name = entry.get("resource") if isinstance(entry, dict) else str(entry)
-        if not name:
-            continue
-        if name.lower().endswith(OPAQUE_RESOURCE_EXT):
-            opaque.append(name)
+        if not name or name.lower().endswith(IMAGE_RESOURCE_EXT):
             continue
         if not name.lower().endswith(".json"):
+            opaque.append(name)
             continue
         # A draft that cannot be read is a draft that may still hold the old
         # URL. Report the item as failed rather than clean.
@@ -565,7 +614,8 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
 
         bdir = backup_dir / "resources" / item.id
         bdir.mkdir(parents=True, exist_ok=True)
-        (bdir / name.replace("/", "__")).write_text(original, encoding="utf-8")
+        write_private(bdir / name.replace("/", "__"), original)
+        note_backup_tokens(item.id, original)
 
         folder, _, leaf = name.rpartition("/")
         try:
@@ -637,11 +687,15 @@ def plan_types(types: list[str], include_item_url: bool) -> tuple[list[str], lis
     return list(types), [t for t in types if t in SERVICE_ITEM_TYPES]
 
 
-def exit_status(failed: int, incomplete: bool) -> int:
-    """2 beats 3: a failed write matters more than an incomplete listing."""
+def exit_status(failed: int, incomplete: bool, unread: int = 0) -> int:
+    """2 beats 3: a failed write matters more than an incomplete scan.
+
+    An item whose data or resources the tool did not read is an incomplete
+    scan too: exit 0 would say that item was checked.
+    """
     if failed:
         return EXIT_FAILED
-    if incomplete:
+    if incomplete or unread:
         return EXIT_INCOMPLETE
     return EXIT_OK
 
@@ -751,8 +805,31 @@ def teardown_logging() -> None:
     root.handlers[:] = []
 
 
+_STRAY = "unrecognized arguments: "
+
+
+def hide_stray_values(message: str) -> str:
+    """Keep option names, hide the values, in argparse's 'unrecognized' error.
+
+    argparse repeats every argument it did not recognise. A mistyped --pass
+    SECRET would print SECRET, and a scheduled task logs stderr.
+    """
+    if not message.startswith(_STRAY):
+        return message
+    shown = []
+    for tok in message[len(_STRAY):].split(" "):
+        m = re.match(r"(--[A-Za-z][\w-]*)(=.*)?$", tok)
+        shown.append("[hidden]" if not m else m.group(1) + ("=[hidden]" if m.group(2) else ""))
+    return _STRAY + " ".join(shown)
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        super().error(hide_stray_values(message))
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         description="Bulk-replace REST service URLs in AGOL/Portal content. "
                     "Dry-run unless --apply is given.",
         allow_abbrev=False)
@@ -842,7 +919,7 @@ class Scan:
     counts: dict = field(default_factory=lambda: {
         "clean": 0, "matched": 0, "updated": 0, "skipped": 0,
         "failed": 0, "resumed": 0})
-    opaque_items: list = field(default_factory=list)
+    unread_items: list = field(default_factory=list)
     n: int = 0
     stats: dict = field(default_factory=dict)
 
@@ -890,8 +967,8 @@ def scan_org(gis, args, old: str, new: str, opts: MatchOpts, apply: bool,
                          scan_resources=not args.no_resources)
         scan.results.append(r)
         scan.counts[r.status] = scan.counts.get(r.status, 0) + 1
-        if r.opaque:
-            scan.opaque_items.append((item.id, r.opaque))
+        if r.unread:
+            scan.unread_items.append((item.id, r.unread))
         log_result(scan.n, r, item)
         if r.hits and r.status == "updated":
             record_updated(updated_ids, item.id)
@@ -912,15 +989,15 @@ def log_summary(scan: Scan, csv_path: Path, apply: bool) -> None:
             log.info("  %-8s %d", k, scan.counts[k])
     log.info("  %-8s %d", "urls", total_urls)
     log.info("report : %s", csv_path.resolve())
-    if scan.opaque_items:
+    if scan.unread_items:
         log.warning("")
-        log.warning("%d changed item(s) also carry binary resources this tool "
-                    "cannot read. URLs inside them are NOT rewritten. Check "
-                    "them by hand:", len(scan.opaque_items))
-        for iid, names in scan.opaque_items[:15]:
+        log.warning("%d item(s) carry data or resources this tool did not read, "
+                    "so the old URL may still be in them. Check them by hand:",
+                    len(scan.unread_items))
+        for iid, names in scan.unread_items[:15]:
             log.warning("  %s  %s", iid, ", ".join(names[:5]))
-        if len(scan.opaque_items) > 15:
-            log.warning("  ... %d more (see run.log)", len(scan.opaque_items) - 15)
+        if len(scan.unread_items) > 15:
+            log.warning("  ... %d more (see run.log)", len(scan.unread_items) - 15)
     if not apply and total_urls:
         log.info("")
         log.info("DRY-RUN. Nothing was written. Review %s, then re-run with "
@@ -976,13 +1053,17 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
     log_summary(scan, csv_path, apply)
 
     incomplete = is_incomplete(scan.stats)
-    status = exit_status(scan.counts.get("failed", 0), incomplete)
+    unread = len(scan.unread_items)
+    status = exit_status(scan.counts.get("failed", 0), incomplete, unread)
     if scan.counts.get("failed"):
         log.warning("%d items FAILED, see the report", scan.counts["failed"])
     if incomplete:
         log.warning("INCOMPLETE: %d of %s reported items were returned. A clean "
                     "result does not cover the rest. Exit status %d.",
                     scan.stats["seen"], scan.stats["reported"], EXIT_INCOMPLETE)
+    if unread:
+        log.warning("UNREAD: %d item(s) were not fully scanned. A clean result "
+                    "does not cover them. Exit status %d.", unread, EXIT_INCOMPLETE)
     return status
 
 
@@ -1102,7 +1183,13 @@ class _StubOrg(object):
         item = self.items[iid]
         if name is None:
             names = list(item["resources"]) + item.get("ghosts", [])
-            return 200, {"resources": [{"resource": n} for n in names]}
+            start = int(params.get("start", 1))
+            num = min(int(params.get("num", 10)), item.get("res_page", 100))
+            page = names[start - 1:start - 1 + num]
+            nxt = start + len(page) if start - 1 + len(page) < len(names) else -1
+            return 200, {"total": len(names), "start": start, "num": len(page),
+                         "nextStart": nxt,
+                         "resources": [{"resource": n} for n in page]}
         if name in item["resources"]:
             return 200, item["resources"][name].encode("utf-8")
         return 404, {"error": {"code": 404, "message": "Resource does not exist."}}
@@ -1234,9 +1321,6 @@ class _StubResources(object):
     def _url(self, tail):
         gis = self._item._gis
         return "%scontent/items/%s/resources%s" % (gis._portal.resturl, self._item.id, tail)
-
-    def list(self):
-        return self._item._gis._con.get(self._url(""), {"f": "json"})["resources"]
 
     def get(self, file, try_json=True):
         raw = self._item._gis._con.get(self._url("/" + file), {}, try_json=False)
@@ -1647,8 +1731,9 @@ def _selftest_core(h):
     check(scan_types.count("WMS") == 1 and "Feature Service" in scan_types and not ignored,
           "plan_types: the flag adds each service type once")
     check(exit_status(0, False) == 0 and exit_status(1, False) == 2
-          and exit_status(0, True) == 3 and exit_status(2, True) == 2,
-          "exit_status: failure beats incomplete beats ok")
+          and exit_status(0, True) == 3 and exit_status(2, True) == 2
+          and exit_status(0, False, 2) == 3 and exit_status(1, False, 2) == 2,
+          "exit_status: failure beats incomplete or unread beats ok")
     check(is_incomplete({"reported": 5, "seen": 3}) and not is_incomplete({"reported": 3, "seen": 3})
           and not is_incomplete({"reported": 0, "seen": 0}) and not is_incomplete({}),
           "is_incomplete compares what was reported with what was seen")
@@ -1729,15 +1814,21 @@ def _scenario_dry_run(cli, h):
                     owner="+owner",
                     resources={"draft_1.json": json.dumps({"a": [{"url": _OLD + "/5"}]}),
                                "config/config.json": json.dumps({"url": _OLD + "/6"}),
-                               "thumb.png": "x", "notes.txt": "plain"},
+                               "thumb.png": "x", "notes.txt": "plain",
+                               "data.xlsx": "x"},
                     ghosts=[""]),
         "m2": _item("Clean", {"keep": {"url": _OTHER}}),
         "m3": _item("Empty", None),
         "m4": _item("Number", None, raw="5"),
+        "m5": _item("Paged", {}, res_page=2,
+                    resources=dict(("%s.json" % n, json.dumps({"u": _OLD + "/" + n}))
+                                   for n in "abc")),
+        "m6": _item("Clean with a text resource", {"keep": {"url": _OTHER}},
+                    resources={"readme.txt": _OLD + "/0"}),
     })
     out_dir = cli.out_dir()
     r = cli.run(cli.base(["-v"], out_dir=out_dir))
-    check(r.code == 0, "dry run exits 0, got %r" % (r.code,))
+    check(r.code == 3, "a dry run that left items unread exits 3, got %r" % (r.code,))
     check(cli.org.writes() == [], "a dry run sends no write request to the org" + PIN)
     check(not os.path.exists(os.path.join(out_dir, "updated_ids.txt"))
           and not os.listdir(os.path.join(out_dir, "backups")),
@@ -1759,10 +1850,18 @@ def _scenario_dry_run(cli, h):
     check(skipped == {"m3": "empty data, no matching resources", "m4": "data is int"},
           "empty data and non-dict data are reported as skipped with a reason")
     check(not any(row[0] == "m2" for row in rows[1:]), "a clean item gets no row")
-    check("thumb.png" in r.out and "binary resources" in r.out,
-          "the opaque resource is listed for manual follow-up")
-    check(not any("notes.txt" in c for row in rows for c in row) and "notes.txt" not in r.out,
-          "a text resource is neither scanned nor listed")
+    check("data.xlsx" in r.out and "this tool did not read" in r.out,
+          "a binary resource is listed for manual follow-up")
+    check("notes.txt" in r.out and not any("notes.txt" in c for row in rows for c in row),
+          "a text resource that is not .json is listed as unread and not scanned" + PIN)
+    check("thumb.png" not in r.out, "a plain image resource is not listed")
+    check("UNREAD: 3 item(s)" in r.out and "data (int)" in r.out
+          and "m6  readme.txt" in r.out and not any(row[0] == "m6" for row in rows[1:]),
+          "an item whose data or resource is unread is listed even when it is clean" + PIN)
+    m5 = [row for row in rows[1:] if row[0] == "m5"]
+    starts = [p["start"] for (_m, path, p) in cli.org.requests if path.endswith("/m5/resources")]
+    check(len(m5) == 3 and starts == ["1", "3"],
+          "a resource list longer than one page is followed to the end" + PIN)
     check("DRY-RUN. Nothing was written" in r.out, "a dry run says nothing was written")
     check("[2] clean    m2  Clean" in r.out, "-v shows clean items")
     log_text = dict(_tree_text(out_dir))["run.log"]
@@ -1864,6 +1963,8 @@ def _scenario_failures(cli, h):
         "f9": _item("Res not JSON", {}, resources={"bad.json": "not json at all"}),
         "fa": _item("Res error body", {}, resources={"draft_1.json": json.dumps({"u": _OLD})}),
         "fb": _item("Data error body", _webmap(_OLD + "/9")),
+        "fc": _item("List error body", _webmap(_OLD + "/7")),
+        "fd": _item("List no array", _webmap(_OLD + "/8")),
     })
     boom = (500, {"error": {"code": 500, "message": "boom"}})
     denied = (200, {"error": {"code": 403, "message": "Not allowed."}})
@@ -1871,7 +1972,9 @@ def _scenario_failures(cli, h):
                       "f6/data": [(503, {}), (429, {}), (503, {})],
                       "f7/updateResources": [boom],
                       "fa/resources/draft_1.json": [denied],
-                      "fb/data": [denied, denied]}
+                      "fb/data": [denied, denied],
+                      "fc/resources": [denied],
+                      "fd/resources": [(200, {"total": 0})]}
     sleeps = []
     real_sleep = time.sleep
     time.sleep = sleeps.append
@@ -1884,8 +1987,14 @@ def _scenario_failures(cli, h):
     check(r.code == 2, "failed items make the run exit 2, got %r" % (r.code,))
     rows = _read_csv(os.path.join(out_dir, "changes.csv"))
     err = dict((row[0], row[8]) for row in rows[1:] if row[4] == "failed")
-    check(sorted(err) == ["f1", "f2", "f3", "f4", "f5", "f7", "f8", "f9", "fa", "fb"],
-          "ten items are reported failed, one per failure mode")
+    check(sorted(err) == ["f1", "f2", "f3", "f4", "f5", "f7", "f8", "f9", "fa", "fb",
+                          "fc", "fd"],
+          "twelve items are reported failed, one per failure mode")
+    check(err["fc"].startswith("resources.list: resource list request refused: 403: Not allowed.")
+          and cli.org.items["fc"]["data"]["operationalLayers"][0]["url"] == _OLD + "/7",
+          "a resource list that answers 200 with an error body fails the item, it is not an empty list" + PIN)
+    check(err["fd"] == "resources.list: the resource list has no 'resources' array",
+          "a resource list answer without a resources array fails the item" + PIN)
     check(err["f1"].startswith("fetch: item data is not JSON"),
           "get_data's swallowed error is found by the raw re-fetch" + PIN)
     check(err["f2"].startswith("server refused the write: "),
@@ -1911,7 +2020,7 @@ def _scenario_failures(cli, h):
     blob = r.out + r.err + "".join(t for _p, t in _tree_text(out_dir))
     check(_STUB_TOKEN not in blob and "[redacted]" in blob,
           "a library error that repeats the request url does not leak the token" + PIN)
-    check("10 items FAILED" in r.out, "the console says how many items failed")
+    check("12 items FAILED" in r.out, "the console says how many items failed")
 
 
 def _scenario_crash(cli, h):
@@ -2020,20 +2129,20 @@ def _scenario_volume(cli, h):
     for i in range(16):
         cli.org.items["o%02d" % i] = _item(
             "O%d" % i, _webmap(_OLD + "/0"),
-            resources={"thumb.png": "x", "draft_1.json": json.dumps({"u": _OLD})})
+            resources={"pack.zip": "x", "draft_1.json": json.dumps({"u": _OLD})})
     out_dir = cli.out_dir()
     r = cli.run(cli.base(["-v"], out_dir=out_dir))
     log_text = dict(_tree_text(out_dir))["run.log"]
-    check(r.code == 0 and "... 2 more" in log_text,
+    check(r.code == 3 and "... 2 more" in log_text,
           "an item with 22 urls logs 20 and counts the rest")
-    check("16 changed item(s) also carry binary resources" in r.out
+    check("16 item(s) carry data or resources this tool did not read" in r.out
           and "... 1 more (see run.log)" in r.out,
-          "the opaque list shows 15 items and counts the rest")
+          "the unread list shows 15 items and counts the rest")
     rows = _read_csv(os.path.join(out_dir, "changes.csv"))
     check(len(rows) == 1 + 22 + 16 * 2, "changes.csv has one row per url, %d rows" % len(rows))
     lean = cli.run(cli.base(["--no-resources"]))
-    check(lean.code == 0 and "binary resources" not in lean.out and "urls     38" in lean.out,
-          "--no-resources skips the resources: 38 urls and no opaque list")
+    check(lean.code == 0 and "did not read" not in lean.out and "urls     38" in lean.out,
+          "--no-resources skips the resources: 38 urls, no unread list, exit 0")
     bad = _StubCon()
     bad.token = "wrong"
     resp = bad.get(cli.url + "/sharing/rest/search", {"q": "x", "start": 1, "num": 1})
@@ -2132,8 +2241,16 @@ def _scenario_cli(cli, h):
     arg = cli.run(["--ap"])
     check(arg.code == 2, "a write-flag prefix exits 2 through main as well" + PIN)
     typo = cli.run(["--pass", "hunter2SECRET"])
-    check(typo.code == 2 and "unrecognized arguments: --pass hunter2SECRET" in typo.err,
-          "a misspelt --password is refused and argparse echoes the argument (a known limit)")
+    check(typo.code == 2 and "unrecognized arguments: --pass [hidden]" in typo.err
+          and "hunter2SECRET" not in typo.err + typo.out,
+          "a misspelt --password is refused and its value is not echoed" + PIN)
+    eq = cli.run(["--passw=hunter2SECRET", "-x", "--ap"])
+    check(eq.code == 2 and "--passw=[hidden] [hidden] --ap" in eq.err
+          and "hunter2SECRET" not in eq.err,
+          "a --flag=value form is hidden too, and an unknown option name stays visible" + PIN)
+    badint = cli.run(["--max-items", "x"])
+    check(badint.code == 2 and "invalid int value" in badint.err,
+          "other argparse errors pass through unchanged")
     before = len(cli.org.writes())
     closed = cli.run(cli.base(["--apply"]))
     check(closed.code == 1 and "EOFError" in closed.out and len(cli.org.writes()) == before,
@@ -2159,6 +2276,11 @@ def _scenario_secrets(cli, h):
     backup = dict(files).get("backups/k1.json", "")
     check(_STUB_TOKEN in backup,
           "the backup keeps the original data verbatim, token included, so a rollback works")
+    check("backup of k1 holds 1 token= value(s)" in r.out and _STUB_TOKEN not in r.out,
+          "the run warns that a backup holds a token, without printing it" + PIN)
+    mode = os.stat(os.path.join(out_dir, "backups", "k1.json")).st_mode & 0o077
+    check(os.name == "nt" or mode == 0,
+          "a backup is readable by its owner only (POSIX; Windows uses the folder ACL)" + PIN)
 
 
 def _selftest_io(h):
@@ -2229,6 +2351,15 @@ def _selftest_units(h, tmp):
     stats = {}
     check([i.id for i in iter_items(gis, ["Web Map"], stats=stats)] == ["a"] and stats["seen"] == 1,
           "a null nextStart ends the scan")
+
+    pages = [b'{"resources": [{"resource": "a.json"}], "nextStart": 2}',
+             {"resources": [{"resource": "b.json"}], "nextStart": "x"}]
+    lgis = types.SimpleNamespace(_portal=types.SimpleNamespace(resturl="http://h/"),
+                                 _con=types.SimpleNamespace(
+                                     get=lambda url, params, try_json: pages.pop(0)))
+    got = list_resources(types.SimpleNamespace(id="i", _gis=lgis))
+    check([e["resource"] for e in got] == ["a.json", "b.json"],
+          "list_resources reads a bytes answer and an already parsed one")
 
     # retry: non-transient errors raise at once, transient ones stop at the limit
     calls = []

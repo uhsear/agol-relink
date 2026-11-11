@@ -58,7 +58,7 @@ There is nothing to build.
 
 **A Python that cannot start ArcPy cannot import `arcgis`.** The package loads a geometry engine
 when it is imported, and that step tries to import ArcPy
-(`arcgis/_impl/_geometry_engine.py`, `_detect_available_engines`, in arcgis 2.4.2). In a shell where
+(`arcgis/_impl/_geometry_engine.py`, `_detect_available_engines`, by way of its helper `_is_installed`, in arcgis 2.4.2). In a shell where
 the ArcGIS Pro licence is not initialised, `import arcgis` stops with
 `RuntimeError: The Product License has not been initialized.` The same failure happened with
 `ARCGIS_IO_ENGINE=requests` set. That variable is read in `_select_io_engine`, in the same
@@ -127,13 +127,16 @@ shows that a dry run sends no write request to the organization.
 
 | Code | Meaning |
 |---|---|
-| 0 | the search returned every item the server reported, and no item failed |
-| 1 | refused or aborted: bad URLs, no `APPLY` typed, sign-in failed, `arcgis` missing or broken, or an unexpected error ended the run |
+| 0 | the search returned every item the server reported, no item failed, and every item's data and resources were read |
+| 1 | refused or aborted: bad URLs, no `APPLY` typed, sign-in failed, `arcgis` missing or broken, or an unexpected error ended the run. After an unexpected error, items may already be written: read `updated_ids.txt`. |
 | 2 | at least one item failed. This code also means a command-line usage error. |
-| 3 | the scan was incomplete: the server reported more items than it returned |
+| 3 | the scan was incomplete: the server reported more items than it returned, or an item carries data or a resource this tool did not read |
 
-A clean result with exit 3 does not cover the items the search did not return. Before this version, that
-case printed a warning and exited 0.
+A clean result with exit 3 does not cover the items the search did not return, nor the data or resources
+the tool did not read. The run lists those items at the end, changed or not. Before this version, a short
+search printed a warning and exited 0, and an unchanged item with a binary resource was not mentioned.
+An organization with `.xlsx` or `.zip` resources on its StoryMaps will see exit 3 on every run.
+That is the intended signal: the tool cannot read those files.
 
 ### Spreadsheet safety
 
@@ -155,7 +158,10 @@ then `=` is not guarded either.
 A web map can hold a signed URL, and a library error message repeats the request URL.
 The value of a `token=` or `access_token=` parameter is replaced with `[redacted]` in `changes.csv`,
 in `run.log` and on the console. The per-item backups keep the original data as it was, because a
-rollback needs it. Treat `backups/` as sensitive.
+rollback needs it, so a backup can hold a live token. This is the one output file that can. The run
+logs `backup of <itemid> holds N token= value(s)` without the value, and writes each backup with
+mode 0600 where the system honours it (Windows uses the folder's access list). The session token and
+the password never reach a backup. Treat `backups/` as secret and do not share it.
 
 Only `token=` and `access_token=` query parameters are blanked. A name such as `api_key=` passes through.
 A traceback from an unexpected error goes to `run.log` with the same blanking, and not to the console.
@@ -228,10 +234,10 @@ Each line below was checked against Esri's documentation or the `arcgis` 2.4.2 s
 | `ResourceManager.update()` returns the server dict, and a failure is `{"error": {...}}`, which is truthy | `ResourceManager.update` docstring, same file. The tool treats a dict with `error` as a failure. |
 | `Item.get_data()` turns every exception into `{}` | source of `Item.get_data` in `arcgis/gis/__init__.py`: `except Exception: item_data = {}`. The tool re-fetches the raw payload when the answer is empty. |
 | `ResourceManager.update(file=..., folder_name=..., file_name=...)` replaces an existing resource from an uploaded file | `ResourceManager.update` docstring (`file` is "the path to the file on disk to be used for overwriting an existing file resource"), and the Esri Update Resources page quoted above |
-| `ResourceManager.list()` returns dicts with a `resource` key | `ResourceManager.list` docstring |
+| The tool does not call `ResourceManager.list()`. It reads the resource list itself, pages it, and refuses an error body | `ResourceManager.list` in arcgis 2.4.2 reads `resp.get('resources', [])` from the raw JSON, so a `200` answer that holds an error body comes back as an empty list, as if the item had no drafts. The paging parameters ([Common parameters](https://developers.arcgis.com/rest/users-groups-and-items/common-parameters/)) give `num` a default of 10 and a maximum of 100, and `nextStart` is "the next entry index if the current result set doesn't contain all results, or -1 if it is the last batch". The tool asks for `num=100` and follows `nextStart`. |
 | A search returns only items the signed-in account can access | [Search](https://developers.arcgis.com/rest/users-groups-and-items/search/): "The results of a search only contain items that the user has permission to access." |
 | The top 10,000 results can be paged | same page: "The top 10,000 query results are available to retrieve through pagination." |
-| `created` is a valid sort field | same page: "Supported sort field names are `title`, `created`, `type`, `owner`, `modified`" |
+| `created` is a valid sort field | same page: "Supported sort field names are `title`, `created`, `type`, `owner`, `modified`" and the list goes on with more names |
 | `nextStart` is the next entry index | same page |
 | A page returns at most 100 items | same page: "the maximum allowed value is `100`" for `num`. `PAGE_SIZE` is 100. |
 | Resources can be read by an organization administrator | `ResourceManager.get` docstring: "Only available to the user, item owner, or an organization administrator." |
@@ -244,9 +250,11 @@ If the search returns fewer items than it reports, the run says so and exits 3.
 
 ## What it cannot do
 
-**Binary resources.** URLs inside `.zip`, `.xlsx`, and image resources stay as they are. The run lists
-every changed item that carries one. A Survey123 `.xlsx` can hold a URL in a `pulldata()` call or an
-external `choices` sheet. This tool cannot see it.
+**Resources that are not JSON.** Only `.json` resources are read. URLs inside `.zip`, `.xlsx`, `.txt`,
+`.html` and every other non-JSON resource stay as they are. The run lists every item that carries
+one, changed or not, and exits 3. A Survey123 `.xlsx` can hold a URL in a `pulldata()` call or an
+external `choices` sheet. This tool cannot see it. Plain images (`.png`, `.jpg`, `.jpeg`, `.gif`) are
+neither read nor listed.
 
 **URLs inside a longer string.** Only values that start with the old URL are rewritten. An `href`
 inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL is not rewritten.
@@ -260,12 +268,21 @@ inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL i
 - A crash writes no `changes.csv`. Use `updated_ids.txt` and `--resume`.
 - Use a fresh `--out-dir` for each `--apply` run. The tool writes `backups/<itemid>.json` without checking for an old file.
 - A rollback splits resource names on `__`. A name that contains `__` restores into the wrong folder, and `a/b.json` and `a__b.json` share one backup path.
-- Resource names come from the server and build the backup path. The tool trusts them.
-- Only `.json` resources are read. A `.txt`, `.xml`, `.html` or `.geojson` resource is neither scanned nor listed.
-- Item data that is not a JSON object or array makes the item `skipped`, and its JSON resources are not scanned. A skipped item does not change the exit status.
+- Resource names come from the server and build the backup path. The tool trusts them. On Windows a name with backslashes, such as `..\..\x.json`, can place the backup outside `backups/resources/<itemid>/`. A name with a character Windows forbids, such as `a:b.json`, ends the run with exit 1 and no `changes.csv`.
+- Item data that is not a JSON object or array makes the item `skipped`, and its JSON resources are not scanned. The run lists the item and exits 3.
 - The walk stops at depth 200 with a log warning. The item still counts as clean or matched, and the run exits 0.
 - Passing `--password` puts the password in the process list and shell history. Use `AGOL_PASS` or the prompt.
-  A misspelt flag such as `--pass` is echoed back in the argparse usage error.
+  A misspelt flag such as `--pass SECRET` prints `error: unrecognized arguments: --pass [hidden]`. The tool hides the value of an unrecognised argument. It keeps the option name, so you see what you mistyped.
+- The apostrophe prefix stops a formula on first open. OWASP warns it is not reliable in Excel after the file is saved and re-opened.
+- `changes.csv` is UTF-8 without a byte order mark, so Excel on Windows can show non-ASCII titles as garbled text. Open it with Data > From Text and choose UTF-8.
+- Titles are not stripped of control characters for the console or `run.log`, only for the spreadsheet. A title with a newline can forge a log line.
+- On a Windows console that uses cp1252, a title with characters outside cp1252 makes the logger print a `--- Logging error ---` block and drop that one console line. The run still finishes. `run.log` and `changes.csv` are complete. Set `PYTHONUTF8=1` for non-Latin titles.
+- A search that returns zero items logs `scanned 0 items` and exits 0. That is a clean result for that query only. Check the `server reports N matching items` line, the `--types` spelling and the `--query` clause.
+- A `--resume` directory that does not exist, or has no `updated_ids.txt`, resumes nothing and says nothing. Re-processing an updated item finds no match, so no harm follows.
+- A dry run that reuses an `--out-dir` overwrites the earlier `changes.csv`, which may be the record of an applied run.
+- A lone surrogate character in item JSON makes the backup write fail and ends the run with exit 1.
+- A resource that answers with a non-JSON content type makes the `arcgis` package download it to the system temporary folder and delete a same-named file there, even in a dry run. That is a write outside `--apply`, by the library, on pathological input.
+- Three observations in this README come from a live organization and are not covered by the self-test: the hand check of the write path, the 13 JSON paths in one organization, and the October 2026 `text=` sanitizing.
 - A closed stdin at the `APPLY` prompt ends the run with exit 1. Nothing is written.
 
 ## Notes
@@ -286,7 +303,7 @@ inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL i
 
 ## Testing
 
-`--self-test` runs 250 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 260 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -297,22 +314,24 @@ $ python agol_relink.py --self-test
 agol_relink self-test: no arcgis package, no organization, local stub server only
 --------------------------------------------------------------------
 PASS  service root rewrites
-PASS  a url used as a dict key is not rewritten
+PASS  sublayer index is kept
 ...
 PASS  changes.csv title guards a leading '=' and nothing else  <-- pinned defect
 PASS  a dry run sends no write request to the org  <-- pinned defect
 PASS  a token in a matched url is blanked in changes.csv  <-- pinned defect
-PASS  a server that reports 7 but returns 5 exits 3, not 0  <-- pinned defect
+PASS  a text resource that is not .json is listed as unread and not scanned  <-- pinned defect
+PASS  an item whose data or resource is unread is listed even when it is clean  <-- pinned defect
+PASS  a resource list longer than one page is followed to the end  <-- pinned defect
 PASS  a resource is written as an uploaded file, never as text=  <-- pinned defect
-PASS  a listed resource that cannot be read fails the item, it is not skipped  <-- pinned defect
-PASS  an item data read that answers 200 with an error body is a failure, not clean  <-- pinned defect
-PASS  the session token is in no traceback, console line or log after a crash  <-- pinned defect
-PASS  a wrong password is one actionable message, not a traceback  <-- pinned defect
+PASS  a resource list that answers 200 with an error body fails the item, it is not an empty list  <-- pinned defect
+PASS  a server that reports 7 but returns 5 exits 3, not 0  <-- pinned defect
+PASS  a misspelt --password is refused and its value is not echoed  <-- pinned defect
+PASS  the run warns that a backup holds a token, without printing it  <-- pinned defect
 PASS  the password appears in no output file and not on the console  <-- pinned defect
 PASS  the session token appears in no output file and not on the console  <-- pinned defect
 ...
 --------------------------------------------------------------------
-250 assertions, 0 failed
+260 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -322,27 +341,28 @@ The self-test covers:
 - the formula guard for each of the nine columns, for `=`, tab and carriage return, plus `+`, `-`, `@` and line feed on the cell
 - dry run and `--apply`, backups, `updated_ids.txt`, `--resume`, and the documented rollback
 - every failure path: a refused update, a resource error dict, a raw payload that is not JSON,
-  a failing resource listing, a resource that cannot be read or is not JSON, a `200` answer with an
+  a failing resource listing, a listing that answers `200` with an error body, a resource that cannot be read or is not JSON, a `200` answer with an
   error body for item data or a resource, a search that keeps failing, and a retried `503` and `429`
 - that a resource write is a multipart file upload and never `text=`
-- the incomplete-scan exit, `--max-items`, and `--include-item-url`
+- the incomplete-scan exit, the unread-item exit, a resource list of several pages, `--max-items`, and `--include-item-url`
 - prompts, environment variables, the `CONFIGURATION` block, a wrong password, a missing `arcgis` package,
   and an `arcgis` import that fails on the ArcGIS Pro licence
-- a search of every output file and of the console for the password and the session token
+- a search of every output file except the backups, and of the console, for the password and the session token. The backups hold the item's own data, so a token that the item stored stays in them.
 
 Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 250 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 250 |
-| Windows | 3.9.25 | 250 |
-| Linux | 3.12.3 | 250 |
+| Windows | 3.13.2 (`C:\Python313`) | 260 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 260 |
+| Windows | 3.9.25 | 260 |
+| Windows | 3.12 | 260 |
+| Linux | 3.12.3 | 260 |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`.
 
 Branch coverage was measured with `coverage run --branch agol_relink.py --self-test` on Windows: 100% of
-1435 statements and 312 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
+1498 statements and 322 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
 guard, whose false side only happens on import. The self-test code is part of the measured file.
 
 ### What the self-test does not cover
