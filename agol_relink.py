@@ -417,10 +417,9 @@ def iter_items(gis, item_types: list[str], extra_query: str = "",
 def is_incomplete(stats: dict) -> bool:
     """True when the server reported more items than the scan received.
 
-    A scan that --max-items stopped on purpose is a sample, not a shortfall.
+    A scan that --max-items cut short counts: items it never reached may still
+    hold the old URL. A --max-items that reaches the last item does not.
     """
-    if stats.get("limited"):
-        return False
     return bool(stats.get("reported")) and stats.get("seen", 0) < stats["reported"]
 
 
@@ -455,33 +454,40 @@ def _refuse_error_body(doc: Any, what: str) -> Any:
 def raw_get(item, tail: str, params: dict, what: str) -> Any:
     """GET a sharing path of an item and return the body as the library got it.
 
-    Every read goes through here with force_bytes=True. Without it, the
-    arcgis Connection saves any answer whose Content-Type is not json or text
-    to a file in the system temp folder, removing a file of the same name
-    first. A dry run must not write there.
+    Every read goes through here with return_raw_response=True, which hands
+    back the requests Response. Two reasons. Without it, the arcgis Connection
+    saves any answer whose Content-Type is not json or text to a file in the
+    system temp folder, and a dry run must not write there. With force_bytes
+    alone it returns the body of an HTTP error as if it were content, so a 503
+    with an empty body would read as an item with no data. Here the status is
+    checked: a 429, 502, 503 or 504 is retried, any other non-2xx fails.
     """
     gis = item._gis
     url = "%scontent/items/%s/%s" % (gis._portal.resturl, item.id, tail)
-    return with_retry(gis._con.get, url, params, try_json=False, force_bytes=True,
-                      what="%s %s" % (what, item.id))
+
+    def read() -> bytes:
+        resp = gis._con.get(url, params, try_json=False, return_raw_response=True)
+        if not 200 <= resp.status_code < 300:
+            # No url in the text: it can carry the token.
+            raise RuntimeError(("HTTP %d %s" % (resp.status_code, resp.reason or "")).strip())
+        return resp.content
+
+    return with_retry(read, what="%s %s" % (what, item.id))
 
 
-def parse_json_body(raw: Any, what: str) -> Any:
+def parse_json_body(raw: bytes, what: str) -> Any:
     """The JSON document in a raw answer, or an exception. Binary bytes pass through."""
-    if isinstance(raw, bytes):
-        try:
-            raw = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return raw
-    if isinstance(raw, str):
-        raw = raw.strip()
-        if not raw:
-            return {}
-        try:
-            raw = json.loads(raw)
-        except ValueError:
-            raise RuntimeError("%s is not JSON (%d bytes)" % (what, len(raw)))
-    return _refuse_error_body(raw, what)
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return raw
+    if not text:
+        return {}
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        raise RuntimeError("%s is not JSON (%d bytes)" % (what, len(text)))
+    return _refuse_error_body(doc, what)
 
 
 def fetch_data(item) -> Any:
@@ -1122,15 +1128,24 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
 
     incomplete = is_incomplete(scan.stats)
     unread = len(scan.unread_items)
+    # A search that matched nothing checked nothing. A mistyped --types or
+    # --query gives the same silence as an org with no such item.
+    nothing = scan.n == 0
     # --no-resources reads no resource of any item: a clean run proves less.
     status = exit_status(scan.counts.get("failed", 0),
-                         incomplete or args.no_resources, unread)
+                         incomplete or nothing or args.no_resources, unread)
     if scan.counts.get("failed"):
         log.warning("%d items FAILED, see the report", scan.counts["failed"])
     if incomplete:
-        log.warning("INCOMPLETE: %d of %s reported items were returned. A clean "
+        log.warning("INCOMPLETE: %d of %s reported items were returned%s. A clean "
                     "result does not cover the rest. Exit status %d.",
-                    scan.stats["seen"], scan.stats["reported"], EXIT_INCOMPLETE)
+                    scan.stats["seen"], scan.stats["reported"],
+                    " (--max-items stopped the scan)" if scan.stats["limited"] else "",
+                    EXIT_INCOMPLETE)
+    if nothing:
+        log.warning("INCOMPLETE: the search returned no item, so nothing was "
+                    "checked. Check the --types spelling, the --query clause and "
+                    "the organization. Exit status %d.", EXIT_INCOMPLETE)
     if args.no_resources:
         log.warning("INCOMPLETE: --no-resources read no resource of any item. "
                     "StoryMap and Experience Builder drafts may still hold the "
@@ -1358,26 +1373,37 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         self._send(*getattr(org, "op_" + op)(iid, params, name))
 
 
+class _StubResp(object):
+    """The three attributes of a requests Response that the tool reads."""
+
+    def __init__(self, status_code, content, reason):
+        self.status_code, self.content, self.reason = status_code, content, reason
+
+
 class _StubCon(object):
     def __init__(self):
         self.token = None
         self.spill_dir = None      # like the library's temp folder
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def get(self, url, params, try_json=True, force_bytes=False):
-        """Like Connection.get. Without force_bytes, the library saves the
-        answer to a file in the temp folder when the Content-Type is not json
-        or text. The stub does that to spill_dir for every raw read."""
+    def get(self, url, params, try_json=True, return_raw_response=False):
+        """Like Connection.get. With return_raw_response it hands back the
+        response whatever the status, as the library does. Otherwise the
+        library saves a non-JSON answer to a file in the temp folder when the
+        Content-Type is not json or text. The stub does that to spill_dir for
+        every raw read that does not ask for the response."""
+        if return_raw_response:
+            return self._send(url, params, None, False, want_resp=True)
         raw = self._send(url, params, None, try_json)
-        if self.spill_dir and not try_json and not force_bytes:
+        if self.spill_dir and not try_json:
             with open(os.path.join(self.spill_dir, url.rpartition("/")[2]), "w") as fh:
                 fh.write(raw if isinstance(raw, str) else json.dumps(raw))
-        return raw.encode("utf-8") if force_bytes and isinstance(raw, str) else raw
+        return raw
 
     def post(self, url, params, files=None):
         return self._send(url, {}, params, True, files)
 
-    def _send(self, url, query, form, try_json, files=None):
+    def _send(self, url, query, form, try_json, files=None, want_resp=False):
         query = dict(query)
         if self.token:
             query["token"] = self.token
@@ -1397,12 +1423,17 @@ class _StubCon(object):
         try:
             with self.opener.open(urllib.request.Request(full, data=body,
                                                          headers=headers)) as resp:
-                raw = resp.read().decode("utf-8")
+                data, status, reason = resp.read(), resp.status, resp.reason
         except urllib.error.HTTPError as exc:
+            data, status, reason = exc.read(), exc.code, exc.reason
             exc.close()
-            # requests puts the full URL, token included, in its HTTPError text.
-            raise RuntimeError("%d Server Error: %s for url: %s"
-                               % (exc.code, exc.reason, full))
+            if not want_resp:
+                # requests puts the full URL, token included, in its HTTPError text.
+                raise RuntimeError("%d Server Error: %s for url: %s"
+                                   % (status, reason, full))
+        if want_resp:
+            return _StubResp(status, data, reason)
+        raw = data.decode("utf-8")
         return json.loads(raw) if try_json else raw
 
 
@@ -1973,7 +2004,7 @@ def _scenario_dry_run(cli, h):
     probe.token, probe.spill_dir = _STUB_TOKEN, spill
     probe.get(cli.url + "/sharing/rest/content/items/m1/data", {"f": "json"}, try_json=False)
     check(os.listdir(spill) == ["data"],
-          "the stub saves a read without force_bytes to the temp folder, so the check above can fail")
+          "the stub saves a read without return_raw_response to the temp folder, so the check above can fail")
 
 
 def _scenario_apply(cli, h):
@@ -2105,7 +2136,7 @@ def _scenario_failures(cli, h):
     check(err["f5"].startswith("update: "), "an update that raises is a failure")
     check(err["f7"].startswith("resources.update draft_1.json: "),
           "a resource update that raises is a failure")
-    check(err["f8"].startswith("resources.get gone.json: 404 Server Error"),
+    check(err["f8"] == "resources.get gone.json: HTTP 404 Not Found",
           "a listed resource that cannot be read fails the item, it is not skipped" + PIN)
     check(err["f9"] == "resources.get bad.json: resource is not JSON (15 bytes)",
           "a .json resource that is not JSON fails the item" + PIN)
@@ -2121,6 +2152,38 @@ def _scenario_failures(cli, h):
     check(_STUB_TOKEN not in blob and "[redacted]" in blob,
           "a library error that repeats the request url does not leak the token" + PIN)
     check("12 items FAILED" in r.out, "the console says how many items failed")
+
+
+def _scenario_read_status(cli, h):
+    """A raw read checks the HTTP status. The library returns an error body as content."""
+    check = h.check
+    cli.org.items.update({
+        "r1": _item("Throttled", _webmap(_OLD + "/1")),
+        "r2": _item("Down", _webmap(_OLD + "/2")),
+        "r3": _item("Gone", _webmap(_OLD + "/3")),
+    })
+    html = b"<html>Service Unavailable</html>"
+    cli.org.faults = {"r1/data": [(503, html), (429, b"")],
+                      "r2/data": [(502, b"")] * RETRY_TRIES,
+                      "r3/resources": [(404, b"")]}
+    sleeps = []
+    real_sleep = time.sleep
+    time.sleep = sleeps.append
+    try:
+        out_dir = cli.out_dir()
+        r = cli.run(cli.base(out_dir=out_dir))
+    finally:
+        time.sleep = real_sleep
+    reads = lambda iid: len([q for q in cli.org.requests if q[1].endswith(iid + "/data")])
+    rows = _read_csv(os.path.join(out_dir, "changes.csv"))
+    status = dict((row[0], (row[4], row[8])) for row in rows[1:])
+    check(status["r1"] == ("matched", "") and reads("r1") == 3
+          and len(sleeps) == 2 + RETRY_TRIES - 1,
+          "a 503 with an HTML body and a 429 on an item data read are retried, then read" + PIN)
+    check(status["r2"] == ("failed", "fetch: HTTP 502 Bad Gateway") and reads("r2") == RETRY_TRIES,
+          "a 502 with an empty body is retried, then fails the item, it never reads as no data" + PIN)
+    check(status["r3"] == ("failed", "resources.list: HTTP 404 Not Found") and r.code == 2,
+          "a resource list that answers 404 fails the item and the run exits 2" + PIN)
 
 
 def _scenario_crash(cli, h):
@@ -2184,9 +2247,18 @@ def _scenario_enumeration(cli, h):
     cli.org.page_cap = 0
     cli.org.total_override = 9
     sample = cli.run(cli.base(["--max-items", "2"]))
-    check(sample.code == 0 and "scanned 2 items" in sample.out,
-          "--max-items stops early on purpose and is not an incomplete scan")
+    check(sample.code == 3 and "scanned 2 items" in sample.out
+          and "INCOMPLETE: 2 of 9 reported items were returned (--max-items stopped the scan)"
+          in sample.out,
+          "--max-items that leaves items unexamined exits 3 and says so, not exit 0" + PIN)
     cli.org.total_override = None
+    whole = cli.run(cli.base(["--max-items", "5"]))
+    check(whole.code == 0 and "scanned 5 items" in whole.out and "INCOMPLETE" not in whole.out,
+          "--max-items that reaches the last item is a complete scan")
+    typo = cli.run(cli.base(["--types", "Storymap"]))
+    check(typo.code == 3 and "scanned 0 items" in typo.out
+          and "the search returned no item, so nothing was checked" in typo.out,
+          "a search that returns no item exits 3, not a clean 0" + PIN)
     cli.org.items["e0"]["data"] = None
     cli.org.items["e1"]["raw"] = "not json"
     both = cli.run(cli.base())
@@ -2446,7 +2518,9 @@ def _selftest_io(h):
     tmp = tempfile.mkdtemp(prefix="agol_relink_selftest_")
     try:
         for name, scenario in (("dry", _scenario_dry_run), ("apply", _scenario_apply),
-                               ("failures", _scenario_failures), ("crash", _scenario_crash),
+                               ("failures", _scenario_failures),
+                               ("read_status", _scenario_read_status),
+                               ("crash", _scenario_crash),
                                ("enumeration", _scenario_enumeration),
                                ("item_url", _scenario_item_url),
                                ("volume", _scenario_volume), ("options", _scenario_options),
@@ -2511,13 +2585,14 @@ def _selftest_units(h, tmp):
           "a null nextStart ends the scan")
 
     pages = [b'{"resources": [{"resource": "a.json"}], "nextStart": 2}',
-             {"resources": [{"resource": "b.json"}], "nextStart": "x"}]
+             b'{"resources": [{"resource": "b.json"}], "nextStart": "x"}']
     lgis = types.SimpleNamespace(_portal=types.SimpleNamespace(resturl="http://h/"),
                                  _con=types.SimpleNamespace(
-                                     get=lambda url, params, **kw: pages.pop(0)))
+                                     get=lambda url, params, **kw:
+                                     _StubResp(200, pages.pop(0), "OK")))
     got = list_resources(types.SimpleNamespace(id="i", _gis=lgis))
     check([e["resource"] for e in got] == ["a.json", "b.json"],
-          "list_resources reads a bytes answer and an already parsed one")
+          "list_resources follows nextStart and stops at one that is not a number")
 
     # retry: non-transient errors raise at once, transient ones stop at the limit
     calls = []
@@ -2553,28 +2628,32 @@ def _selftest_units(h, tmp):
     BIN = bytes([80, 75, 3, 4, 255, 254])  # a zip header, then bytes that are not UTF-8
 
     class Item(object):
+        """An item whose reads answer with the listed (status, body) pairs, the last one repeated."""
         id = "i"
 
-        def __init__(self, raw):
+        def __init__(self, raw, status=200):
+            answers = raw if isinstance(raw, list) else [(status, raw)]
+
             def get(url, params, **kw):
                 seen_kw.append(kw)
-                return raw
+                code, body = answers.pop(0) if len(answers) > 1 else answers[0]
+                return _StubResp(code, body if isinstance(body, bytes) else body.encode("utf-8"),
+                                 "Bad Gateway" if code == 502 else "")
             self._gis = types.SimpleNamespace(
                 _portal=types.SimpleNamespace(resturl="http://x/"),
                 _con=types.SimpleNamespace(get=get))
 
     check(fetch_data(Item(b'{"u": 1}')) == {"u": 1}, "a bytes answer is decoded and parsed")
-    check(seen_kw == [{"try_json": False, "force_bytes": True}],
-          "a raw read asks for bytes, so the library saves no file to the temp folder" + PIN)
+    check(seen_kw == [{"try_json": False, "return_raw_response": True}],
+          "a raw read asks for the response, so the library saves no file to the temp folder"
+          " and the tool sees the status" + PIN)
     check(fetch_data(Item(b"")) == {} and fetch_data(Item("  ")) == {}
           and fetch_data(Item(b"null")) == {},
           "an empty answer, bytes or text, or a JSON null is empty data")
-    check(fetch_data(Item({"x": 1})) == {"x": 1} and fetch_data(Item(None)) == {},
-          "an answer that is already parsed is returned, None becomes empty")
     check(fetch_data(Item(BIN)) == BIN,
           "bytes that are not text come back as bytes, for the caller to mark unread")
-    h.raises(lambda: fetch_data(Item({"error": {"code": 403, "message": "no"}})),
-             "a parsed error body is refused, not read as empty data" + PIN, exc=RuntimeError)
+    h.raises(lambda: fetch_data(Item('{"error": {"code": 403, "message": "no"}}')),
+             "an error body is refused, not read as empty data" + PIN, exc=RuntimeError)
     h.raises(lambda: fetch_data(Item("<html>")), "an HTML answer is an error, not empty data",
              exc=RuntimeError)
     h.raises(lambda: fetch_resource(Item(BIN), "x.json"),
@@ -2584,7 +2663,30 @@ def _selftest_units(h, tmp):
     h.raises(lambda: fetch_resource(Item("7"), "x.json"), "a resource that is a bare number is an error",
              exc=RuntimeError)
     check(fetch_resource(Item('{"a": [1]}'), "x.json") == {"a": [1]}, "fetch_resource parses a document")
-    check(seen_kw[-1] == {"try_json": False, "force_bytes": True}, "a resource read asks for bytes too" + PIN)
+    check(seen_kw[-1] == {"try_json": False, "return_raw_response": True},
+          "a resource read asks for the response too" + PIN)
+
+    # the status of a raw read: with force_bytes the library returns an error body as content
+    seen_kw[:] = []
+    sleeps = []
+    real_sleep = time.sleep
+    time.sleep = sleeps.append
+    try:
+        h.raises(lambda: fetch_data(Item(b"", 502)),
+                 "a 502 with an empty body is an error, not an item with no data" + PIN,
+                 exc=RuntimeError)
+        check(len(seen_kw) == RETRY_TRIES and len(sleeps) == RETRY_TRIES - 1,
+              "a 502 is retried until the limit")
+        seen_kw[:] = []
+        check(fetch_data(Item([(503, "<html>"), (429, ""), (200, '{"u": 2}')])) == {"u": 2}
+              and len(seen_kw) == 3,
+              "a 503 and a 429 are retried and the third answer is read" + PIN)
+        seen_kw[:] = []
+        h.raises(lambda: fetch_resource(Item('{"a": 1}', 404), "x.json"),
+                 "a 404 on a resource read is an error", exc=RuntimeError)
+        check(len(seen_kw) == 1, "a 404 is not retried")
+    finally:
+        time.sleep = real_sleep
 
     check(short_names(list("abcdefg")) == "a, b, c, d, e, +2 more" and short_names(["a"]) == "a",
           "a long resource list is cut to five names and a count")
