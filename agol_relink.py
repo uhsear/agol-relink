@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import contextlib
+import copy
 import csv
 import email.parser
 import getpass
@@ -69,8 +70,10 @@ NEW_URL = ""   # e.g. "https://services1.arcgis.com/AbC123/arcgis/rest/services/
 # --- where ----------------------------------------------------------------
 ORG_URL = "https://www.arcgis.com"   # or your Portal, e.g. "https://gis.example.org/portal"
 USERNAME = ""                        # blank -> $AGOL_USER, else prompt
-PASSWORD = ""                        # LEAVE BLANK. Use $AGOL_PASS or the prompt.
-                                     # A password typed here can reach version control.
+# There is no PASSWORD here and no --password flag. A password in a source file
+# can reach version control, and one on the command line lands in shell history,
+# a scheduled task's definition and the process list. Set $AGOL_PASS or type it
+# at the prompt.
 
 # --- safety ---------------------------------------------------------------
 # False = dry-run: scan and report, write nothing. Flipping this to True is the
@@ -235,13 +238,38 @@ def redact(text: Any) -> Any:
     """Blank the value of a token= query parameter. Other values pass through.
 
     A web map can carry a signed URL, and a library error message repeats the
-    request URL, token included. changes.csv and run.log get shared in tickets
-    and forum threads, so neither may hold a live token. The per-item backups
-    keep the original data verbatim: a rollback needs it.
+    request URL, token included. changes.csv, run.log and the backups get
+    shared in tickets and forum threads, so none of them may hold a live token.
     """
     if not isinstance(text, str):
         return text
     return _TOKEN_RE.sub(r"\1[redacted]", text)
+
+
+def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
+    """A copy of a JSON document with every token= value blanked, and the count.
+
+    It works on the parsed strings, not on the dumped text, so a token inside
+    a string that holds more JSON cannot swallow the escaping quote. Past
+    MAX_DEPTH the subtree is copied as it is, the same limit walk_replace has.
+    """
+    if isinstance(node, str):
+        return redact(node), len(_TOKEN_RE.findall(node))
+    if depth > MAX_DEPTH or not isinstance(node, (dict, list)):
+        return node, 0
+    total = 0
+    if isinstance(node, dict):
+        out_map: dict = {}
+        for k, v in node.items():
+            out_map[k], n = redact_doc(v, depth + 1)
+            total += n
+        return out_map, total
+    out_list: list = []
+    for v in node:
+        item, n = redact_doc(v, depth + 1)
+        out_list.append(item)
+        total += n
+    return out_list, total
 
 
 # OWASP "CSV Injection": a cell that starts with one of these is run as a
@@ -424,34 +452,49 @@ def _refuse_error_body(doc: Any, what: str) -> Any:
     return doc
 
 
-def fetch_data(item) -> Any:
-    """Get item data, distinguishing 'empty' from 'fetch failed'.
+def raw_get(item, tail: str, params: dict, what: str) -> Any:
+    """GET a sharing path of an item and return the body as the library got it.
 
-    Item.get_data() swallows every exception and returns {}. That makes a token
-    expiry or a 500 indistinguishable from a map with no matching layers, so we
-    re-fetch the raw payload ourselves when get_data returns something falsy.
+    Every read goes through here with force_bytes=True. Without it, the
+    arcgis Connection saves any answer whose Content-Type is not json or text
+    to a file in the system temp folder, removing a file of the same name
+    first. A dry run must not write there.
     """
-    data = with_retry(item.get_data, what="get_data %s" % item.id)
-    if data:
-        return data
-    # get_data returned {} / None / b''. Confirm that is genuinely the case
-    # rather than a swallowed error, by asking the sharing API directly.
     gis = item._gis
-    url = "%scontent/items/%s/data" % (gis._portal.resturl, item.id)
-    resp = with_retry(gis._con.get, url, {"f": "json"}, try_json=False,
-                      what="raw data %s" % item.id)
-    if isinstance(resp, bytes):
-        resp = resp.decode("utf-8", "replace")
-    if isinstance(resp, str):
-        resp = resp.strip()
-        if not resp:
+    url = "%scontent/items/%s/%s" % (gis._portal.resturl, item.id, tail)
+    return with_retry(gis._con.get, url, params, try_json=False, force_bytes=True,
+                      what="%s %s" % (what, item.id))
+
+
+def parse_json_body(raw: Any, what: str) -> Any:
+    """The JSON document in a raw answer, or an exception. Binary bytes pass through."""
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
             return {}
         try:
-            resp = json.loads(resp)
+            raw = json.loads(raw)
         except ValueError:
-            raise RuntimeError("item data is not JSON (%d bytes)" % len(resp))
-        return _refuse_error_body(resp, "item data")
-    return _refuse_error_body(resp, "item data") or {}
+            raise RuntimeError("%s is not JSON (%d bytes)" % (what, len(raw)))
+    return _refuse_error_body(raw, what)
+
+
+def fetch_data(item) -> Any:
+    """Item data as a parsed document. Empty data is {}, a failed read raises.
+
+    Item.get_data() swallows every exception and returns {}, so a token expiry
+    or a 500 would read as a map with nothing to rewrite. It also saves a
+    non-JSON answer to the temp folder. This reads the raw answer instead.
+    Bytes that are not UTF-8 text come back as bytes: the caller marks the item
+    as not scanned.
+    """
+    doc = parse_json_body(raw_get(item, "data", {"f": "json"}, "raw data"), "item data")
+    return {} if doc is None else doc
 
 
 def list_resources(item) -> list:
@@ -463,17 +506,12 @@ def list_resources(item) -> list:
     itself, refuses an error body, and follows nextStart. The Esri paging
     parameters give num a default of 10 and a maximum of 100.
     """
-    gis = item._gis
-    url = "%scontent/items/%s/resources" % (gis._portal.resturl, item.id)
     entries: list = []
     start = 1
     while True:
-        raw = with_retry(gis._con.get, url, {"f": "json", "num": 100, "start": start},
-                         try_json=False, what="resources.list %s" % item.id)
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-        doc = json.loads(raw) if isinstance(raw, str) else raw
-        _refuse_error_body(doc, "resource list")
+        raw = raw_get(item, "resources", {"f": "json", "num": 100, "start": start},
+                      "resources.list")
+        doc = parse_json_body(raw, "resource list")
         page = doc.get("resources") if isinstance(doc, dict) else None
         if not isinstance(page, list):
             raise RuntimeError("the resource list has no 'resources' array")
@@ -484,22 +522,30 @@ def list_resources(item) -> list:
         start = nxt
 
 
-def write_private(path: Path, text: str) -> None:
-    """Write a backup that only its owner can read, where the OS allows it.
+def fetch_resource(item, name: str) -> Any:
+    """A .json resource as a parsed document. A read that fails raises."""
+    doc = parse_json_body(raw_get(item, "resources/" + name, {}, "resources.get"),
+                          "resource")
+    if not isinstance(doc, (dict, list)):
+        raise RuntimeError("resource is not JSON")
+    return doc
 
-    A backup is the item's original data, so it can hold a signed URL. The mode
-    applies on POSIX. Windows ignores it and uses the folder's ACL.
+
+def write_backup(path: Path, item_id: str, doc: Any) -> None:
+    """Save the original JSON of an item or resource, token= values blanked.
+
+    A backup keeps the item's own data, which can carry a signed URL. The
+    tokens are blanked, so no output file holds one. A rollback from a backup
+    puts back "[redacted]" where a token stood. The file mode is 0600 where
+    the system honours it.
     """
+    safe, n = redact_doc(doc)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
-
-
-def note_backup_tokens(item_id: str, text: str) -> None:
-    n = len(_TOKEN_RE.findall(text))
+        fh.write(json.dumps(safe, ensure_ascii=False))
     if n:
-        log.warning("backup of %s holds %d token= value(s) as the item stores "
-                    "them. Treat backups/ as secret.", item_id, n)
+        log.warning("backup of %s has %d token= value(s) blanked. A rollback "
+                    "from it restores [redacted], not the token.", item_id, n)
 
 
 def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
@@ -517,7 +563,7 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
         return base
 
     hits: list[Hit] = []
-    original = json.dumps(data, ensure_ascii=False) if data else ""
+    original = copy.deepcopy(data)
     if data:
         hits = walk_replace(data, old, new, opts)
 
@@ -548,8 +594,7 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
     if hits:
         # Backup before /data is touched. (Resources, if any, were written
         # earlier, each having taken its own backup first.)
-        write_private(backup_dir / ("%s.json" % item.id), original)
-        note_backup_tokens(item.id, original)
+        write_backup(backup_dir / ("%s.json" % item.id), item.id, original)
         try:
             # update() returns False on a server-side refusal WITHOUT raising --
             # e.g. an item you can read but not edit. Treating that as success is
@@ -565,6 +610,16 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
 
     base.status = "updated"
     return base
+
+
+def safe_backup_name(name: str) -> bool:
+    """May a resource name from the server become a path under backups/?
+
+    A backslash, a drive colon, a leading slash or a '..' segment can point the
+    backup outside the folder. Such an item fails and nothing is written for it.
+    """
+    return not ("\\" in name or ":" in name or name.startswith("/")
+                or ".." in name.split("/"))
 
 
 def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
@@ -596,26 +651,24 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
         # A draft that cannot be read is a draft that may still hold the old
         # URL. Report the item as failed rather than clean.
         try:
-            doc = with_retry(item.resources.get, file=name, try_json=True,
-                             what="resources.get %s/%s" % (item.id, name))
-            _refuse_error_body(doc, "resource")
+            doc = fetch_resource(item, name)
         except Exception as e:
             return hits, opaque, "resources.get %s: %s" % (name, e)
-        if not isinstance(doc, (dict, list)):
-            return hits, opaque, "resources.get %s: the resource is not JSON" % name
 
-        original = json.dumps(doc, ensure_ascii=False)
+        original = copy.deepcopy(doc)
         rhits = walk_replace(doc, old, new, opts, path="[resource:%s]" % name)
         if not rhits:
             continue
         hits.extend(rhits)
         if not apply:
             continue
+        if not safe_backup_name(name):
+            return hits, opaque, ("resources.backup %s: the name would put the backup "
+                                  "outside backups/. Nothing was written" % name)
 
         bdir = backup_dir / "resources" / item.id
         bdir.mkdir(parents=True, exist_ok=True)
-        write_private(bdir / name.replace("/", "__"), original)
-        note_backup_tokens(item.id, original)
+        write_backup(bdir / name.replace("/", "__"), item.id, original)
 
         folder, _, leaf = name.rpartition("/")
         try:
@@ -687,6 +740,10 @@ def plan_types(types: list[str], include_item_url: bool) -> tuple[list[str], lis
     return list(types), [t for t in types if t in SERVICE_ITEM_TYPES]
 
 
+def parse_types(text: str) -> list[str]:
+    return [t.strip() for t in text.split(",") if t.strip()]
+
+
 def exit_status(failed: int, incomplete: bool, unread: int = 0) -> int:
     """2 beats 3: a failed write matters more than an incomplete scan.
 
@@ -707,7 +764,8 @@ def validate_urls(old: str, new: str) -> None:
             raise SystemExit("--%s-url is empty. Refusing to run: an "
                              "empty old URL would match every string." % label)
         if not re.match(r"^https?://[^/\s]+/", u.strip() + "/"):
-            raise SystemExit("--%s-url is not an absolute http(s) URL: %r" % (label, u))
+            raise SystemExit("--%s-url is not an absolute http(s) URL: %r"
+                             % (label, redact(u)))
     if old.rstrip("/").lower() == new.rstrip("/").lower():
         raise SystemExit("old and new URL are the same. Nothing to do.")
     # The new URL must not itself match the old one. Otherwise every rewritten
@@ -721,7 +779,7 @@ def validate_urls(old: str, new: str) -> None:
             "new URL is nested under the old one:\n  old: %s\n  new: %s\n"
             "Rewritten URLs would still match the old prefix, so a second run "
             "would apply the change twice. Narrow --old-url so it does not "
-            "prefix --new-url." % (old, new))
+            "prefix --new-url." % (redact(old), redact(new)))
 
 
 def breadth_warning(old: str) -> str:
@@ -838,7 +896,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Defaults come from the CONFIGURATION block; env vars beat it; flags win.
     p.add_argument("--org", default=os.environ.get("AGOL_URL") or ORG_URL)
     p.add_argument("--user", default=os.environ.get("AGOL_USER") or USERNAME or None)
-    p.add_argument("--password", default=os.environ.get("AGOL_PASS") or PASSWORD or None)
     p.add_argument("--old-url", default=OLD_URL or None)
     p.add_argument("--new-url", default=NEW_URL or None)
     p.add_argument("--types", default=",".join(DEFAULT_TYPES),
@@ -896,7 +953,8 @@ def connect(org: str, user: str, pwd: str):
         gis = GIS(org, user, pwd)
     except Exception as e:
         sys.exit("Could not sign in to %s as %s: %s\nCheck the organization "
-                 "URL, the username and the password." % (org, user, redact(str(e))))
+                 "URL, the username and the password."
+                 % (redact(org), user, redact(str(e))))
     log.info("connected as %s (role=%s, org=%s)",
              gis.users.me.username, gis.users.me.role, gis.properties.id)
     return gis
@@ -924,8 +982,17 @@ class Scan:
     stats: dict = field(default_factory=dict)
 
 
+def short_names(names: list[str], limit: int = 5) -> str:
+    """The first few names, then how many more there are."""
+    shown = ", ".join(names[:limit])
+    return shown if len(names) <= limit else "%s, +%d more" % (shown, len(names) - limit)
+
+
 def log_result(n: int, r: Result, item) -> None:
     title = (item.title or "")[:60]
+    if r.unread:
+        # The console lists the first 15 such items at the end. run.log keeps all.
+        log.debug("[%d] unread   %s  %s : %s", n, item.id, title, ", ".join(r.unread))
     if r.hits:
         log.info("[%d] %-8s %s  %s  (%d url%s)", n, r.status, item.id, title,
                  len(r.hits), "" if len(r.hits) == 1 else "s")
@@ -952,15 +1019,20 @@ def scan_org(gis, args, old: str, new: str, opts: MatchOpts, apply: bool,
             continue
 
         if item.type in SERVICE_ITEM_TYPES:
-            if args.include_item_url:
-                r = process_item_url(item, old, new, opts, apply)
-                if r:
-                    scan.results.append(r)
-                    scan.counts[r.status] = scan.counts.get(r.status, 0) + 1
-                    log.info("[%d] %-8s %s  %s", scan.n, r.status, item.id,
-                             (item.title or "")[:60])
-                    if r.status == "updated":
-                        record_updated(updated_ids, item.id)
+            if not args.include_item_url:
+                # main() refuses a run that asks for these types without the
+                # flag. A server that returns one anyway is not skipped quietly.
+                scan.unread_items.append(
+                    (item.id, ["item url (--include-item-url is off)"]))
+                continue
+            r = process_item_url(item, old, new, opts, apply)
+            if r:
+                scan.results.append(r)
+                scan.counts[r.status] = scan.counts.get(r.status, 0) + 1
+                log.info("[%d] %-8s %s  %s", scan.n, r.status, item.id,
+                         (item.title or "")[:60])
+                if r.status == "updated":
+                    record_updated(updated_ids, item.id)
             continue
 
         r = process_item(item, old, new, opts, apply, backup_dir,
@@ -995,9 +1067,10 @@ def log_summary(scan: Scan, csv_path: Path, apply: bool) -> None:
                     "so the old URL may still be in them. Check them by hand:",
                     len(scan.unread_items))
         for iid, names in scan.unread_items[:15]:
-            log.warning("  %s  %s", iid, ", ".join(names[:5]))
+            log.warning("  %s  %s", iid, short_names(names))
         if len(scan.unread_items) > 15:
-            log.warning("  ... %d more (see run.log)", len(scan.unread_items) - 15)
+            log.warning("  ... %d more, each on an 'unread' line in run.log",
+                        len(scan.unread_items) - 15)
     if not apply and total_urls:
         log.info("")
         log.info("DRY-RUN. Nothing was written. Review %s, then re-run with "
@@ -1019,7 +1092,7 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
         out_dir: Path) -> int:
     opts = MatchOpts(ignore_case=not args.case_sensitive,
                      any_scheme=not args.strict_scheme)
-    types = [t.strip() for t in args.types.split(",") if t.strip()]
+    types = parse_types(args.types)
 
     log.info("mode      : %s", "APPLY (writes to the org)" if apply
              else "DRY-RUN (no writes)")
@@ -1040,12 +1113,7 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
         log.info("aborted by operator")
         return EXIT_REFUSED
 
-    scan_types, ignored = plan_types(types, args.include_item_url)
-    if ignored:
-        # Otherwise these get enumerated and then silently skipped, which reads
-        # as "nothing to fix" rather than "you forgot a flag".
-        log.warning("%s in --types but --include-item-url is off: those items "
-                    "will be skipped, not scanned.", ", ".join(ignored))
+    scan_types, _ = plan_types(types, args.include_item_url)
 
     scan = scan_org(gis, args, old, new, opts, apply, scan_types, done, out_dir)
     csv_path = out_dir / "changes.csv"
@@ -1054,13 +1122,19 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
 
     incomplete = is_incomplete(scan.stats)
     unread = len(scan.unread_items)
-    status = exit_status(scan.counts.get("failed", 0), incomplete, unread)
+    # --no-resources reads no resource of any item: a clean run proves less.
+    status = exit_status(scan.counts.get("failed", 0),
+                         incomplete or args.no_resources, unread)
     if scan.counts.get("failed"):
         log.warning("%d items FAILED, see the report", scan.counts["failed"])
     if incomplete:
         log.warning("INCOMPLETE: %d of %s reported items were returned. A clean "
                     "result does not cover the rest. Exit status %d.",
                     scan.stats["seen"], scan.stats["reported"], EXIT_INCOMPLETE)
+    if args.no_resources:
+        log.warning("INCOMPLETE: --no-resources read no resource of any item. "
+                    "StoryMap and Experience Builder drafts may still hold the "
+                    "old URL. Exit status %d.", EXIT_INCOMPLETE)
     if unread:
         log.warning("UNREAD: %d item(s) were not fully scanned. A clean result "
                     "does not cover them. Exit status %d.", unread, EXIT_INCOMPLETE)
@@ -1075,13 +1149,23 @@ def main(argv: list[str] | None = None) -> int:
 
     org = args.org or input("Organization URL [https://www.arcgis.com]: ") or "https://www.arcgis.com"
     user = args.user or input("Username: ")
-    pwd = args.password or getpass.getpass("Password: ")
+    pwd = os.environ.get("AGOL_PASS") or getpass.getpass("Password: ")
     old = args.old_url or input("Old REST service URL to replace: ")
     new = args.new_url or input("New REST service URL: ")
     # Strip BEFORE validating: otherwise " https://HOST/x" and "https://host/x"
     # slip past the same-URL guard and produce a mass write of case-only edits.
     old, new = old.strip(), new.strip()
     validate_urls(old, new)
+    _, unscanned = plan_types(parse_types(args.types), args.include_item_url)
+    if unscanned:
+        # A service item keeps its URL on the item, not in its data. Without the
+        # flag every such item would be listed and skipped, and the run would
+        # read as clean.
+        raise SystemExit("--types names %s, whose url is a property of the item, "
+                         "not part of its data. Add --include-item-url to rewrite "
+                         "it, or take the type out of --types. Refusing to run: "
+                         "no item of that type would be examined."
+                         % ", ".join(unscanned))
 
     # --dry-run always wins, so a config file with APPLY = True can still be
     # overridden from the command line.
@@ -1277,10 +1361,18 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
 class _StubCon(object):
     def __init__(self):
         self.token = None
+        self.spill_dir = None      # like the library's temp folder
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def get(self, url, params, try_json=True):
-        return self._send(url, params, None, try_json)
+    def get(self, url, params, try_json=True, force_bytes=False):
+        """Like Connection.get. Without force_bytes, the library saves the
+        answer to a file in the temp folder when the Content-Type is not json
+        or text. The stub does that to spill_dir for every raw read."""
+        raw = self._send(url, params, None, try_json)
+        if self.spill_dir and not try_json and not force_bytes:
+            with open(os.path.join(self.spill_dir, url.rpartition("/")[2]), "w") as fh:
+                fh.write(raw if isinstance(raw, str) else json.dumps(raw))
+        return raw.encode("utf-8") if force_bytes and isinstance(raw, str) else raw
 
     def post(self, url, params, files=None):
         return self._send(url, {}, params, True, files)
@@ -1318,17 +1410,6 @@ class _StubResources(object):
     def __init__(self, item):
         self._item = item
 
-    def _url(self, tail):
-        gis = self._item._gis
-        return "%scontent/items/%s/resources%s" % (gis._portal.resturl, self._item.id, tail)
-
-    def get(self, file, try_json=True):
-        raw = self._item._gis._con.get(self._url("/" + file), {}, try_json=False)
-        try:
-            return json.loads(raw)
-        except ValueError:
-            return raw
-
     def update(self, file, folder_name=None, file_name=None):
         gis = self._item._gis
         params = {"f": "json", "fileName": file_name}
@@ -1350,18 +1431,6 @@ class _StubItem(object):
         self.owner = row.get("owner")
         self.url = row.get("url")
         self.resources = _StubResources(self)
-
-    def get_data(self):
-        """Like arcgis.gis.Item.get_data: every exception becomes {}."""
-        url = "%scontent/items/%s/data" % (self._gis._portal.resturl, self.id)
-        try:
-            raw = self._gis._con.get(url, {"f": "json"}, try_json=False)
-            doc = json.loads(raw) if raw else None
-        except Exception:
-            return {}
-        if isinstance(doc, dict) and "error" in doc:
-            return {}
-        return doc
 
     def update(self, item_properties=None, data=None):
         params = {"f": "json"}
@@ -1390,9 +1459,10 @@ class _StubContent(object):
 class _StubGIS(object):
     """Stands in for arcgis.gis.GIS. Signs in over HTTP, so a wrong password fails."""
 
-    def __init__(self, org_url, user, password):
+    def __init__(self, org_url, user, password, spill_dir=None):
         self._portal = types.SimpleNamespace(resturl=org_url + "/sharing/rest/")
         self._con = _StubCon()
+        self._con.spill_dir = spill_dir
         resp = self._con.post(self._portal.resturl + "generateToken",
                               {"username": user, "password": password})
         if "error" in resp:
@@ -1457,6 +1527,7 @@ class _Cli(object):
         self.url = org.start()
         self.workdir = workdir
         self.count = 0
+        self.spill_dir = None
 
     def out_dir(self):
         self.count += 1
@@ -1484,7 +1555,7 @@ class _Cli(object):
         if arcgis == "stub":
             fake = types.ModuleType("arcgis")
             fake_gis = types.ModuleType("arcgis.gis")
-            fake_gis.GIS = _StubGIS
+            fake_gis.GIS = lambda o, u, p: _StubGIS(o, u, p, self.spill_dir)
             sys.modules["arcgis"], sys.modules["arcgis.gis"] = fake, fake_gis
         else:
             sys.meta_path.insert(0, finder)
@@ -1510,7 +1581,7 @@ class _Cli(object):
                                      msg=msg)
 
     def base(self, extra=(), out_dir=None, user=_STUB_USER, old=_OLD, new=_NEW):
-        return (["--org", self.url, "--user", user, "--password", _STUB_PASSWORD,
+        return (["--org", self.url, "--user", user,
                  "--old-url", old, "--new-url", new,
                  "--out-dir", out_dir or self.out_dir()] + list(extra))
 
@@ -1531,6 +1602,15 @@ class _FailingFinder(object):
         if name == "arcgis":
             raise self.error
         return None
+
+
+def _exit_message(fn):
+    """The text of the SystemExit that fn raises, or "" if it raises none."""
+    try:
+        fn()
+    except SystemExit as e:
+        return str(e.code)
+    return ""
 
 
 def _exit_codes(fn):
@@ -1705,6 +1785,13 @@ def _selftest_core(h):
     raises(lambda: validate_urls(host, host.replace("https", "http") + "/arcgis"),
            "nested detection sees through the scheme variant")
     raises(lambda: validate_urls(_OLD, _OLD + "/extra"), "new is old plus a path segment is refused")
+    for label, args in (("a rejected url", ("gis.example.org/x?token=TOK-1", _NEW)),
+                        ("a nested pair", (host, host + "/arcgis?access_token=TOK-1"))):
+        text = _exit_message(lambda a=args: validate_urls(*a))
+        check(text.startswith("--old-url is not") or text.startswith("new URL is nested"),
+              "validate_urls refuses %s" % label)
+        check("TOK-1" not in text and "token=[redacted]" in text,
+              "the refusal of %s does not echo the token" % label + PIN)
     doubled = rewrite(host + "/x", match_prefix(host + "/x", host, o), host + "/arcgis")
     check(doubled == host + "/arcgis/x" and match_prefix(doubled, host, o) >= 0,
           "the rewritten url still matches old, hence the refusal")
@@ -1873,6 +1960,20 @@ def _scenario_dry_run(cli, h):
           "every search page sorts on the near-unique field")
     check('orgid:ORG1 AND (type:"Web Map")' == sort_params[0]["q"],
           "the query is scoped to the org and the item types")
+    spill = os.path.join(cli.workdir, "spill")
+    os.makedirs(spill)
+    cli.spill_dir = spill
+    try:
+        cli.run(cli.base())
+    finally:
+        cli.spill_dir = None
+    check(os.listdir(spill) == [],
+          "a dry run saves nothing to the temp folder, which the library does for a non-JSON type" + PIN)
+    probe = _StubCon()
+    probe.token, probe.spill_dir = _STUB_TOKEN, spill
+    probe.get(cli.url + "/sharing/rest/content/items/m1/data", {"f": "json"}, try_json=False)
+    check(os.listdir(spill) == ["data"],
+          "the stub saves a read without force_bytes to the temp folder, so the check above can fail")
 
 
 def _scenario_apply(cli, h):
@@ -1969,10 +2070,10 @@ def _scenario_failures(cli, h):
     boom = (500, {"error": {"code": 500, "message": "boom"}})
     denied = (200, {"error": {"code": 403, "message": "Not allowed."}})
     cli.org.faults = {"f4/resources": [boom], "f5/update": [boom],
-                      "f6/data": [(503, {}), (429, {}), (503, {})],
+                      "f6/data": [(503, {}), (429, {})],
                       "f7/updateResources": [boom],
                       "fa/resources/draft_1.json": [denied],
-                      "fb/data": [denied, denied],
+                      "fb/data": [denied],
                       "fc/resources": [denied],
                       "fd/resources": [(200, {"total": 0})]}
     sleeps = []
@@ -1980,8 +2081,7 @@ def _scenario_failures(cli, h):
     time.sleep = sleeps.append
     try:
         out_dir = cli.out_dir()
-        r = cli.run(cli.base(["--apply", "--yes", "--password", _STUB_PASSWORD],
-                             out_dir=out_dir))
+        r = cli.run(cli.base(["--apply", "--yes"], out_dir=out_dir))
     finally:
         time.sleep = real_sleep
     check(r.code == 2, "failed items make the run exit 2, got %r" % (r.code,))
@@ -1996,7 +2096,7 @@ def _scenario_failures(cli, h):
     check(err["fd"] == "resources.list: the resource list has no 'resources' array",
           "a resource list answer without a resources array fails the item" + PIN)
     check(err["f1"].startswith("fetch: item data is not JSON"),
-          "get_data's swallowed error is found by the raw re-fetch" + PIN)
+          "an item data read that fails is a failure, not empty data" + PIN)
     check(err["f2"].startswith("server refused the write: "),
           "Item.update returning False is a failure, not a success" + PIN)
     check(err["f3"].startswith("resources.update draft_1.json: 403: Not allowed."),
@@ -2007,7 +2107,7 @@ def _scenario_failures(cli, h):
           "a resource update that raises is a failure")
     check(err["f8"].startswith("resources.get gone.json: 404 Server Error"),
           "a listed resource that cannot be read fails the item, it is not skipped" + PIN)
-    check(err["f9"] == "resources.get bad.json: the resource is not JSON",
+    check(err["f9"] == "resources.get bad.json: resource is not JSON (15 bytes)",
           "a .json resource that is not JSON fails the item" + PIN)
     check(err["fa"].startswith("resources.get draft_1.json: resource request refused: 403: Not allowed."),
           "a resource read that answers 200 with an error body fails the item" + PIN)
@@ -2040,8 +2140,17 @@ def _scenario_crash(cli, h):
           "a search that keeps failing ends in one line and exit 1, got %r" % (r.code,))
     check(_STUB_TOKEN not in r.out + r.err + run_log and "[redacted]" in r.out,
           "the session token is in no traceback, console line or log after a crash" + PIN)
-    check(r.err == "" and "Traceback (most recent call last)" in run_log,
+    check(r.err == "" and "Traceback (most recent call last)" in run_log
+          and "Traceback" not in r.out,
           "the traceback goes to run.log, redacted, and not to the console")
+    cli.org.faults = {"search": [(503, {})] * RETRY_TRIES}
+    time.sleep = lambda seconds: None
+    try:
+        loud = cli.run(cli.base(["--apply", "--yes", "-v"]))
+    finally:
+        time.sleep = real_sleep
+    check("Traceback (most recent call last)" in loud.out and _STUB_TOKEN not in loud.out,
+          "with -v the traceback also reaches the console, with the token blanked" + PIN)
     check(not os.path.exists(os.path.join(out_dir, "changes.csv"))
           and "--resume %s" % out_dir in r.out,
           "a crash writes no changes.csv and the message names --resume")
@@ -2085,7 +2194,7 @@ def _scenario_enumeration(cli, h):
 
 
 def _scenario_item_url(cli, h):
-    """Service items: --include-item-url, and the warning when it is missing."""
+    """Service items: --include-item-url, and the refusal when it is missing."""
     check = h.check
     svc = lambda url, **kw: dict(_item("Svc", {}, **kw), type="Feature Service", url=url)
     cli.org.items.update({
@@ -2097,11 +2206,13 @@ def _scenario_item_url(cli, h):
     })
     cli.org.faults = {"svc4/update": [(500, {"error": {"code": 500, "message": "boom"}})]}
     types_arg = ["--types", "Web Map,Feature Service"]
+    seen = len(cli.org.requests)
     r = cli.run(cli.base(types_arg))
-    check("Feature Service in --types but --include-item-url is off" in r.out,
-          "naming a service type without the flag warns")
-    check(r.code == 0 and "svc1" not in r.out and "matched  1" in r.out,
-          "those service items are skipped, not scanned")
+    check(r.code == 1 and "--types names Feature Service" in r.msg and len(cli.org.requests) == seen,
+          "naming a service type without the flag is refused before any request" + PIN)
+    only = cli.run(cli.base(["--types", "Feature Service", "--yes"]))
+    check(only.code == 1 and "scanned" not in only.out,
+          "a run of service types alone is refused, not reported as 'scanned 3 items'" + PIN)
     out_dir = cli.out_dir()
     dry = cli.run(cli.base(["--include-item-url"], out_dir=out_dir))
     rows = _read_csv(os.path.join(out_dir, "changes.csv"))
@@ -2136,13 +2247,17 @@ def _scenario_volume(cli, h):
     check(r.code == 3 and "... 2 more" in log_text,
           "an item with 22 urls logs 20 and counts the rest")
     check("16 item(s) carry data or resources this tool did not read" in r.out
-          and "... 1 more (see run.log)" in r.out,
+          and "... 1 more, each on an 'unread' line in run.log" in r.out,
           "the unread list shows 15 items and counts the rest")
+    unread_lines = [ln for ln in log_text.splitlines() if "] unread " in ln]
+    check(len(unread_lines) == 16 and any(" o15 " in ln and "pack.zip" in ln for ln in unread_lines),
+          "run.log names every unread item, the 16th included, with its resource" + PIN)
     rows = _read_csv(os.path.join(out_dir, "changes.csv"))
     check(len(rows) == 1 + 22 + 16 * 2, "changes.csv has one row per url, %d rows" % len(rows))
     lean = cli.run(cli.base(["--no-resources"]))
-    check(lean.code == 0 and "did not read" not in lean.out and "urls     38" in lean.out,
-          "--no-resources skips the resources: 38 urls, no unread list, exit 0")
+    check(lean.code == 3 and "did not read" not in lean.out and "urls     38" in lean.out
+          and "--no-resources read no resource" in lean.out,
+          "--no-resources skips the resources: 38 urls, and the run exits 3, not 0" + PIN)
     bad = _StubCon()
     bad.token = "wrong"
     resp = bad.get(cli.url + "/sharing/rest/search", {"q": "x", "start": 1, "num": 1})
@@ -2172,21 +2287,26 @@ def _scenario_options(cli, h):
     last = [p for (_m, path, p) in cli.org.requests if path.endswith("/search")][-1]
     check(last["q"].endswith(' AND (owner:"jsmith")'), "--query is added to the search as a clause")
 
-    names = ("OLD_URL", "NEW_URL", "ORG_URL", "USERNAME", "PASSWORD", "APPLY", "ASSUME_YES")
+    names = ("OLD_URL", "NEW_URL", "ORG_URL", "USERNAME", "APPLY", "ASSUME_YES")
     saved = dict((k, globals()[k]) for k in names)
     globals().update(OLD_URL=_OLD, NEW_URL=_NEW, ORG_URL=cli.url, USERNAME=_STUB_USER,
-                     PASSWORD=_STUB_PASSWORD, APPLY=True, ASSUME_YES=True)
+                     APPLY=True, ASSUME_YES=True)
     try:
         before = len(cli.org.writes())
         configured = cli.run(["--out-dir", cli.out_dir()])
         wrote = len(cli.org.writes()) - before
         forced = cli.run(["--out-dir", cli.out_dir(), "--dry-run"])
+        globals().update(ORG_URL="http://127.0.0.1:1", USERNAME="block-user")
+        envwins = cli.run(["--out-dir", cli.out_dir(), "--dry-run"],
+                          env={"AGOL_URL": cli.url, "AGOL_USER": _STUB_USER})
     finally:
         globals().update(saved)
     check(configured.code == 0 and wrote == 3 and cli.org.items["x3"]["data"]["operationalLayers"][0]["url"] == _NEW + "/0",
           "the CONFIGURATION block alone drives a run, APPLY and ASSUME_YES included")
     check(forced.code == 0 and len(cli.org.writes()) - before == wrote and "DRY-RUN (no writes)" in forced.out,
           "--dry-run overrides APPLY = True in the CONFIGURATION block" + PIN)
+    check(envwins.code == 0 and "connected as tester" in envwins.out,
+          "AGOL_URL and AGOL_USER beat ORG_URL and USERNAME in the CONFIGURATION block")
 
 
 def _scenario_cli(cli, h):
@@ -2216,7 +2336,7 @@ def _scenario_cli(cli, h):
                   env={"AGOL_USER": _STUB_USER, "AGOL_PASS": _STUB_PASSWORD})
     check(env.code == 0 and "connected as tester" in env.out,
           "AGOL_USER and AGOL_PASS supply the credentials")
-    envurl = cli.run(["--user", _STUB_USER, "--password", _STUB_PASSWORD, "--old-url", _OLD,
+    envurl = cli.run(["--user", _STUB_USER, "--old-url", _OLD,
                       "--new-url", _NEW, "--out-dir", cli.out_dir()], env={"AGOL_URL": cli.url})
     check(envurl.code == 0, "AGOL_URL supplies the organization")
     flag = cli.run(cli.base(user="other"), env={"AGOL_USER": _STUB_USER})
@@ -2240,10 +2360,10 @@ def _scenario_cli(cli, h):
     check(same.code == 1 and "same" in same.msg, "bad urls are refused before any sign-in")
     arg = cli.run(["--ap"])
     check(arg.code == 2, "a write-flag prefix exits 2 through main as well" + PIN)
-    typo = cli.run(["--pass", "hunter2SECRET"])
-    check(typo.code == 2 and "unrecognized arguments: --pass [hidden]" in typo.err
-          and "hunter2SECRET" not in typo.err + typo.out,
-          "a misspelt --password is refused and its value is not echoed" + PIN)
+    typo = cli.run(["--password", "hunter2SECRET"])
+    check(typo.code == 2 and "unrecognized arguments: --password [hidden]" in typo.err
+          and "hunter2SECRET" not in typo.err + typo.out and not cli.org.writes()[n:],
+          "there is no --password flag: it is refused and its value is not echoed" + PIN)
     eq = cli.run(["--passw=hunter2SECRET", "-x", "--ap"])
     check(eq.code == 2 and "--passw=[hidden] [hidden] --ap" in eq.err
           and "hunter2SECRET" not in eq.err,
@@ -2265,22 +2385,59 @@ def _scenario_secrets(cli, h):
     """No credential reaches an output file, the console or the log."""
     check = h.check
     cli.org.items["k1"] = _item("K", _webmap(_OLD + "/0?token=" + _STUB_TOKEN))
+    cli.org.items["k2"] = _item(
+        "K two", _webmap(_OLD + "/1?token=" + _STUB_TOKEN),
+        resources={"draft_3.json": json.dumps({"u": _OLD + "/2?token=" + _STUB_TOKEN})})
     cli.org.faults = {"k1/data": [(500, {})]}
     out_dir = cli.out_dir()
     r = cli.run(cli.base(["--apply", "--yes", "-v"], out_dir=out_dir))
     files = _tree_text(out_dir)
-    blob = r.out + r.err + "".join(t for p, t in files if not p.startswith("backups/"))
+    blob = r.out + r.err + "".join(t for p, t in files)
     check(_STUB_PASSWORD not in blob, "the password appears in no output file and not on the console" + PIN)
-    check(_STUB_TOKEN not in blob, "the session token appears in no output file and not on the console" + PIN)
-    check(len(files) >= 3, "the grep covered the log, the report and the backup")
-    backup = dict(files).get("backups/k1.json", "")
-    check(_STUB_TOKEN in backup,
-          "the backup keeps the original data verbatim, token included, so a rollback works")
-    check("backup of k1 holds 1 token= value(s)" in r.out and _STUB_TOKEN not in r.out,
-          "the run warns that a backup holds a token, without printing it" + PIN)
-    mode = os.stat(os.path.join(out_dir, "backups", "k1.json")).st_mode & 0o077
+    check(_STUB_TOKEN not in blob,
+          "no token appears in any output file, the backups included, or on the console" + PIN)
+    check(len(files) >= 5, "the grep covered the log, the report and the backups")
+    backup = dict(files).get("backups/k2.json", "")
+    check(json.loads(backup)["operationalLayers"][0]["url"] == _OLD + "/1?token=[redacted]",
+          "a backup holds the original data with the token value blanked" + PIN)
+    check(dict(files).get("backups/resources/k2/draft_3.json") == json.dumps(
+        {"u": _OLD + "/2?token=[redacted]"}), "a resource backup has its token blanked too" + PIN)
+    check("backup of k2 has 1 token= value(s) blanked" in r.out and _STUB_TOKEN not in r.out,
+          "the run says a backup has a token blanked, without printing it" + PIN)
+    mode = os.stat(os.path.join(out_dir, "backups", "k2.json")).st_mode & 0o077
     check(os.name == "nt" or mode == 0,
           "a backup is readable by its owner only (POSIX; Windows uses the folder ACL)" + PIN)
+    back = cli.run(cli.base(["--apply", "--yes"], old=_NEW, new=_OLD))
+    check(back.code == 0 and cli.org.items["k2"]["data"]["operationalLayers"][0]["url"]
+          == _OLD + "/1?token=" + _STUB_TOKEN
+          and cli.org.items["k2"]["resources"]["draft_3.json"] == json.dumps(
+              {"u": _OLD + "/2?token=" + _STUB_TOKEN}),
+          "a run with the two urls swapped restores the item with its token intact")
+
+
+def _scenario_unsafe_name(cli, h):
+    """A resource name from the server cannot steer a backup out of backups/."""
+    check = h.check
+    check(safe_backup_name("draft_1.json") and safe_backup_name("config/config.json")
+          and not any(safe_backup_name(n) for n in
+                      ("../x.json", "a/../x.json", "/x.json", "a\\x.json", "c:x.json")),
+          "safe_backup_name refuses '..', a leading slash, a backslash and a drive colon" + PIN)
+    doc = json.dumps({"u": _OLD})
+    cli.org.items["u1"] = _item("U", {}, resources={"../evil.json": doc})
+    cli.org.items["u2"] = _item("U two", {}, resources={"draft_1.json": doc, "a:b.json": doc})
+    out_dir = cli.out_dir()
+    r = cli.run(cli.base(["--apply", "--yes"], out_dir=out_dir))
+    rows = _read_csv(os.path.join(out_dir, "changes.csv"))
+    err = dict((row[0], row[8]) for row in rows[1:] if row[4] == "failed")
+    check(r.code == 2 and err["u1"].startswith("resources.backup ../evil.json: the name would put")
+          and err["u2"].startswith("resources.backup a:b.json:"),
+          "an unsafe resource name fails the item, exit 2, instead of ending the run" + PIN)
+    dry = cli.run(cli.base())
+    check(dry.code == 0 and "matched  2" in dry.out,
+          "a dry run reports a resource with an unsafe name like any other")
+    check(not os.path.exists(os.path.join(cli.workdir, "evil.json"))
+          and cli.org.items["u1"]["resources"]["../evil.json"] == doc,
+          "nothing is written outside backups/, and the resource is left as it was" + PIN)
 
 
 def _selftest_io(h):
@@ -2294,7 +2451,8 @@ def _selftest_io(h):
                                ("item_url", _scenario_item_url),
                                ("volume", _scenario_volume), ("options", _scenario_options),
                                ("cli", _scenario_cli),
-                               ("secrets", _scenario_secrets)):
+                               ("secrets", _scenario_secrets),
+                               ("unsafe", _scenario_unsafe_name)):
             cli = _Cli(_StubOrg(), os.path.join(tmp, name))
             os.makedirs(cli.workdir)
             try:
@@ -2356,7 +2514,7 @@ def _selftest_units(h, tmp):
              {"resources": [{"resource": "b.json"}], "nextStart": "x"}]
     lgis = types.SimpleNamespace(_portal=types.SimpleNamespace(resturl="http://h/"),
                                  _con=types.SimpleNamespace(
-                                     get=lambda url, params, try_json: pages.pop(0)))
+                                     get=lambda url, params, **kw: pages.pop(0)))
     got = list_resources(types.SimpleNamespace(id="i", _gis=lgis))
     check([e["resource"] for e in got] == ["a.json", "b.json"],
           "list_resources reads a bytes answer and an already parsed one")
@@ -2391,28 +2549,106 @@ def _selftest_units(h, tmp):
     check(with_retry(lambda x: x + 1, 1) == 2, "with_retry passes arguments and returns the value")
 
     # fetch_data edge shapes
+    seen_kw = []
+    BIN = bytes([80, 75, 3, 4, 255, 254])  # a zip header, then bytes that are not UTF-8
+
     class Item(object):
         id = "i"
 
-        def __init__(self, first, raw):
-            self._first, self._raw = first, raw
+        def __init__(self, raw):
+            def get(url, params, **kw):
+                seen_kw.append(kw)
+                return raw
             self._gis = types.SimpleNamespace(
                 _portal=types.SimpleNamespace(resturl="http://x/"),
-                _con=types.SimpleNamespace(get=lambda *a, **k: self._raw))
+                _con=types.SimpleNamespace(get=get))
 
-        def get_data(self):
-            return self._first
-
-    check(fetch_data(Item({"a": 1}, None)) == {"a": 1}, "fetch_data returns truthy data as is")
-    check(fetch_data(Item({}, b"")) == {} and fetch_data(Item(None, "  ")) == {},
-          "an empty raw payload, bytes or text, is empty data")
-    check(fetch_data(Item({}, b'{"u": 1}')) == {"u": 1}, "a bytes raw payload is decoded and parsed")
-    check(fetch_data(Item({}, {"x": 1})) == {"x": 1} and fetch_data(Item({}, None)) == {},
-          "a raw payload that is already parsed is returned, None becomes empty")
-    h.raises(lambda: fetch_data(Item({}, {"error": {"code": 403, "message": "no"}})),
+    check(fetch_data(Item(b'{"u": 1}')) == {"u": 1}, "a bytes answer is decoded and parsed")
+    check(seen_kw == [{"try_json": False, "force_bytes": True}],
+          "a raw read asks for bytes, so the library saves no file to the temp folder" + PIN)
+    check(fetch_data(Item(b"")) == {} and fetch_data(Item("  ")) == {}
+          and fetch_data(Item(b"null")) == {},
+          "an empty answer, bytes or text, or a JSON null is empty data")
+    check(fetch_data(Item({"x": 1})) == {"x": 1} and fetch_data(Item(None)) == {},
+          "an answer that is already parsed is returned, None becomes empty")
+    check(fetch_data(Item(BIN)) == BIN,
+          "bytes that are not text come back as bytes, for the caller to mark unread")
+    h.raises(lambda: fetch_data(Item({"error": {"code": 403, "message": "no"}})),
              "a parsed error body is refused, not read as empty data" + PIN, exc=RuntimeError)
-    h.raises(lambda: fetch_data(Item({}, "<html>")), "an HTML raw payload is an error, not empty data",
+    h.raises(lambda: fetch_data(Item("<html>")), "an HTML answer is an error, not empty data",
              exc=RuntimeError)
+    h.raises(lambda: fetch_resource(Item(BIN), "x.json"),
+             "a resource of binary bytes is not JSON", exc=RuntimeError)
+    h.raises(lambda: fetch_resource(Item("[1"), "x.json"), "a resource of broken JSON is an error",
+             exc=RuntimeError)
+    h.raises(lambda: fetch_resource(Item("7"), "x.json"), "a resource that is a bare number is an error",
+             exc=RuntimeError)
+    check(fetch_resource(Item('{"a": [1]}'), "x.json") == {"a": [1]}, "fetch_resource parses a document")
+    check(seen_kw[-1] == {"try_json": False, "force_bytes": True}, "a resource read asks for bytes too" + PIN)
+
+    check(short_names(list("abcdefg")) == "a, b, c, d, e, +2 more" and short_names(["a"]) == "a",
+          "a long resource list is cut to five names and a count")
+
+    # redact_doc: strings are redacted one by one, so JSON stays valid
+    inner = json.dumps({"u": "https://h/x?token=AAA&f=json"})
+    doc = {"a": ["https://h/y?access_token=BBB", 5, None], "s": inner, "n": {"k": "plain"}}
+    safe, n = redact_doc(doc)
+    check(n == 2 and "AAA" not in json.dumps(safe) and "BBB" not in json.dumps(safe),
+          "redact_doc blanks every token= value in nested lists, dicts and strings" + PIN)
+    check(json.loads(safe["s"]) == {"u": "https://h/x?token=[redacted]&f=json"},
+          "a token inside a string that holds JSON leaves that JSON valid" + PIN)
+    check(doc["a"][0].endswith("BBB") and safe["a"][1:] == [5, None] and safe["n"] == {"k": "plain"},
+          "redact_doc leaves the input and the other values alone")
+    deep = leaf = {}
+    for _ in range(MAX_DEPTH + 3):
+        leaf["k"] = {}
+        leaf = leaf["k"]
+    leaf["k"] = "?token=ZZZ"
+    check(redact_doc(deep)[1] == 0, "redact_doc stops at MAX_DEPTH like the walk does")
+
+    # connect: a sign-in failure does not echo a token that sits in the org url
+    fake, fake_gis = types.ModuleType("arcgis"), types.ModuleType("arcgis.gis")
+
+    def refuse_sign_in(org, user, pwd):
+        raise RuntimeError("Invalid username or password.")
+
+    fake_gis.GIS = refuse_sign_in
+    saved = dict((k, sys.modules.get(k)) for k in ("arcgis", "arcgis.gis"))
+    sys.modules["arcgis"], sys.modules["arcgis.gis"] = fake, fake_gis
+    try:
+        text = _exit_message(lambda: connect("https://h.example.org/portal?token=ORG-TOK-3", "u", "p"))
+    finally:
+        for k in saved:
+            sys.modules.pop(k, None)
+        sys.modules.update(dict((k, v) for k, v in saved.items() if v is not None))
+    check(text.startswith("Could not sign in") and "ORG-TOK-3" not in text and "token=[redacted]" in text,
+          "a sign-in failure does not echo a token in the organization url" + PIN)
+
+    # scan_org: a service item that the search returns without the flag is reported
+    svc_page = [{"total": 1, "nextStart": -1,
+                 "results": [types.SimpleNamespace(id="s1", type="Feature Service", title="S")]}]
+    gis, _c = _fake_gis(svc_page)
+    scan = scan_org(gis, types.SimpleNamespace(query="", max_items=0, include_item_url=False,
+                                               no_resources=False),
+                    _OLD, _NEW, MatchOpts(), False, ["Web Map"], set(), Path(tmp))
+    check(scan.results == [] and scan.unread_items == [("s1", ["item url (--include-item-url is off)"])]
+          and is_incomplete(scan.stats) is False and exit_status(0, False, 1) == EXIT_INCOMPLETE,
+          "a service item returned without --include-item-url is listed unread, so the run exits 3" + PIN)
+    check(_exit_message(lambda: None) == "", "_exit_message returns empty text when nothing is raised")
+
+    # redact leaves the forms the README lists as not blanked
+    passthrough = "a?oauth_token=1&refresh_token=2&token%3D3&ticket=4&password=5&api_key=6 token=7"
+    check(redact(passthrough) == passthrough and redact(7) == 7,
+          "redact blanks only token= and access_token= query parameters, as the README says")
+
+    # a backup written over an old file keeps the old file's mode (POSIX)
+    reused = Path(tmp) / "reused.json"
+    reused.write_text("old", encoding="utf-8")
+    os.chmod(str(reused), 0o644)
+    write_backup(reused, "r1", {"a": 1})
+    check(os.name == "nt" or (os.stat(str(reused)).st_mode & 0o777 == 0o644
+                              and json.loads(reused.read_text(encoding="utf-8")) == {"a": 1}),
+          "a backup written over an old file keeps that file's mode, as the README says")
 
     # depth warning and the redacting log filter
     records = []
