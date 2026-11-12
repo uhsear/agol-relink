@@ -228,33 +228,110 @@ def walk_replace(node: Any, old: str, new: str, opts: MatchOpts,
     return hits
 
 
+def _continues(text: str, end: int) -> bool:
+    """Does the character at `end` extend a host or path name?"""
+    c = text[end:end + 1]
+    if not c:
+        return False
+    return c.isalnum() or c in "_-" or (c in ".:" and text[end + 1:end + 2].isalnum())
+
+
+def _has_old_url(text: str, forms: list) -> bool:
+    for needle, fold in forms:
+        hay = text.lower() if fold else text
+        start = hay.find(needle)
+        while start >= 0:
+            if not _continues(text, start + len(needle)):
+                return True
+            start = hay.find(needle, start + 1)
+    return False
+
+
+def _scan_embedded(node: Any, forms: list, path: str, out: list, depth: int) -> None:
+    if depth > MAX_DEPTH:
+        return
+    if isinstance(node, dict):
+        pairs: Iterable = list(node.items())
+    elif isinstance(node, list):
+        pairs = list(enumerate(node))
+    else:
+        return
+    for k, v in pairs:
+        p = "%s.%s" % (path, k) if isinstance(k, str) else "%s[%d]" % (path, k)
+        if (isinstance(k, str) and _has_old_url(k, forms)) or (
+                isinstance(v, str) and _has_old_url(v, forms)):
+            out.append(p)
+        _scan_embedded(v, forms, p, out, depth + 1)
+
+
+def find_embedded(node: Any, old: str, opts: MatchOpts, path: str = "") -> list[str]:
+    """Paths of text that holds the old URL somewhere other than its start.
+
+    walk_replace rewrites only a value that starts with the old URL. Pop-up
+    HTML, story text, a percent-encoded url= parameter and a dictionary key can
+    hold the old URL deeper in. This tool cannot rewrite those safely, so it
+    reports them and the run exits 3. Call it after walk_replace: a value that
+    was rewritten no longer starts with the old URL. Reads only.
+    """
+    forms: list = []
+    for cand in _scheme_variants(old, opts.any_scheme):
+        cand = cand.rstrip("/")
+        if cand:
+            forms.append((cand.lower() if opts.ignore_case else cand, opts.ignore_case))
+            forms.append((urllib.parse.quote(cand, safe="").lower(), True))
+    out: list[str] = []
+    _scan_embedded(node, forms, path, out, 0)
+    return out
+
+
+def embedded_note(label: str, paths: list[str]) -> list[str]:
+    """The `unread` entry for a document, or nothing when no path was found."""
+    if not paths:
+        return []
+    more = " and %d more" % (len(paths) - 1) if len(paths) > 1 else ""
+    return ["%s: old URL inside longer text at %s%s" % (label, paths[0], more)]
+
+
 # --------------------------------------------------------------------------
 # Output hygiene: tokens in URLs, and spreadsheet formulas in CSV cells
 # --------------------------------------------------------------------------
-_TOKEN_RE = re.compile(r"(?i)((?:^|[?&;])(?:access_)?token=)[^&#\s\"']*")
+# Whole parameter names only: "mytoken=" and "authToken=" are not matched.
+_SECRET_NAMES = ("access_token|oauth_token|refresh_token|id_token|token|api_key|apikey|key"
+                 "|ticket|password|passwd|pwd|client_secret|secret|sig")
+# The name follows the start of the text, ? & ; # or an encoded ? or &. The
+# value ends at & # white space, a quote, or an encoded &.
+_TOKEN_RE = re.compile(r"(?i)((?:^|[?&;#]|%3F|%26)(?:" + _SECRET_NAMES
+                       + r")(?:=|%3D))(?:(?!%26)[^&#\s\"'])*")
+# user:password@host inside a URL
+_USERINFO_RE = re.compile(r"(://[^/\s:@?#]+:)[^/\s@?#]+(?=@)")
+
+
+def count_secrets(text: str) -> int:
+    return len(_TOKEN_RE.findall(text)) + len(_USERINFO_RE.findall(text))
 
 
 def redact(text: Any) -> Any:
-    """Blank the value of a token= query parameter. Other values pass through.
+    """Blank the value of a credential parameter and of user:password@ in a URL.
 
     A web map can carry a signed URL, and a library error message repeats the
     request URL, token included. changes.csv, run.log and the backups get
-    shared in tickets and forum threads, so none of them may hold a live token.
+    shared in tickets and forum threads, so none of them may hold a live
+    credential. The parameter names are listed in _SECRET_NAMES.
     """
     if not isinstance(text, str):
         return text
-    return _TOKEN_RE.sub(r"\1[redacted]", text)
+    return _USERINFO_RE.sub(r"\1[redacted]", _TOKEN_RE.sub(r"\1[redacted]", text))
 
 
 def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
-    """A copy of a JSON document with every token= value blanked, and the count.
+    """A copy of a JSON document with every credential value blanked, and the count.
 
     It works on the parsed strings, not on the dumped text, so a token inside
     a string that holds more JSON cannot swallow the escaping quote. Past
     MAX_DEPTH the subtree is copied as it is, the same limit walk_replace has.
     """
     if isinstance(node, str):
-        return redact(node), len(_TOKEN_RE.findall(node))
+        return redact(node), count_secrets(node)
     if depth > MAX_DEPTH or not isinstance(node, (dict, list)):
         return node, 0
     total = 0
@@ -550,7 +627,7 @@ def write_backup(path: Path, item_id: str, doc: Any) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(safe, ensure_ascii=False))
     if n:
-        log.warning("backup of %s has %d token= value(s) blanked. A rollback "
+        log.warning("backup of %s has %d credential value(s) blanked. A rollback "
                     "from it restores [redacted], not the token.", item_id, n)
 
 
@@ -570,8 +647,10 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
 
     hits: list[Hit] = []
     original = copy.deepcopy(data)
+    embedded: list[str] = []
     if data:
         hits = walk_replace(data, old, new, opts)
+        embedded = embedded_note("data", find_embedded(data, old, opts))
 
     # /data is only half the story for draft-bearing types. See the docstring
     # on process_resources.
@@ -585,7 +664,9 @@ def process_item(item, old: str, new: str, opts: MatchOpts, apply: bool,
             return base
         # An unchanged item counts too: its only copy of the old URL may sit in
         # a resource this tool does not read.
-        base.unread = unread
+        base.unread = embedded + unread
+    else:
+        base.unread = embedded
 
     base.hits = hits + res_hits
     if not base.hits:
@@ -663,6 +744,8 @@ def process_resources(item, old: str, new: str, opts: MatchOpts, apply: bool,
 
         original = copy.deepcopy(doc)
         rhits = walk_replace(doc, old, new, opts, path="[resource:%s]" % name)
+        opaque.extend(embedded_note("resource %s" % name,
+                                    find_embedded(doc, old, opts, "[resource:%s]" % name)))
         if not rhits:
             continue
         hits.extend(rhits)
@@ -1212,6 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
 # --------------------------------------------------------------------------
 _STUB_TOKEN = "TOKEN-SECRET-7731"
 _STUB_PASSWORD = "PASSWORD-SECRET-4410"
+_STUB_KEY = "KEY-SECRET-4471"
 _STUB_USER = "tester"
 
 
@@ -1765,12 +1849,52 @@ def _selftest_core(h):
     check(walk_replace(keyed, _OLD, _NEW, o) == [] and list(keyed) == [_OLD],
           "a url used as a dict key is not rewritten")
 
+    # --- find_embedded: the old url deeper inside a string, or in a key ---
+    pop = {"popupInfo": {"description": "<img src='%s/0/images/a'> text" % _OLD},
+           "layers": [{"title": "see %s." % _OLD}], "u": _OLD + "/0"}
+    check(find_embedded(pop, _OLD, o) == [".popupInfo.description", ".layers[0].title", ".u"],
+          "find_embedded names every string that holds the old url, a leading one included" + PIN)
+    walk_replace(pop, _OLD, _NEW, o)
+    check(find_embedded(pop, _OLD, o) == [".popupInfo.description", ".layers[0].title"],
+          "after the walk only the embedded urls remain" + PIN)
+    enc = {"a": "https://x.example.org/proxy?url=" + urllib.parse.quote(_OLD + "/0", safe=""),
+           "b": "https://x.example.org/proxy?url=" + urllib.parse.quote(_OLD, safe="").lower()}
+    check(find_embedded(enc, _OLD, o) == [".a", ".b"],
+          "find_embedded sees a percent-encoded old url in either hex case" + PIN)
+    check(find_embedded(keyed, _OLD, o) == ["." + _OLD],
+          "find_embedded sees the old url used as a dict key" + PIN)
+    check(find_embedded({"k": {_OLD: {"u": _OLD + "/x"}}}, _OLD, o) == [".k." + _OLD, ".k." + _OLD + ".u"],
+          "the walk goes on below a key that holds the old url")
+    check(find_embedded({"a": "see %s/0 and %s" % (_OLD.upper(), _OLD)}, _OLD, o) == [".a"]
+          and find_embedded({"a": _OLD.upper() + " x"}, _OLD, MatchOpts(ignore_case=False)) == [],
+          "find_embedded follows the ignore_case option")
+    check(find_embedded({"a": "see " + _OLD.replace("https", "http") + " x"}, _OLD, o) == [".a"]
+          and find_embedded({"a": "see " + _OLD.replace("https", "http") + " x"}, _OLD,
+                            MatchOpts(any_scheme=False)) == [],
+          "find_embedded follows the any_scheme option")
+    for tail in ("2", "_old", "-x", ".evil.org", ":8443", "X"):
+        check(find_embedded({"a": "see " + _OLD + tail}, _OLD, o) == [],
+              "find_embedded does not count %r after the old url, a longer name" % tail + PIN)
+    for tail in ("", "/0", "?f=json", "#x", '"', "'>", ")", ".", ". Next", " and", "<br>"):
+        check(find_embedded({"a": "see " + _OLD + tail}, _OLD, o) == [".a"],
+              "find_embedded counts %r after the old url, a boundary" % tail + PIN)
+    check(find_embedded({"a": "see " + _OLD + "2 and " + _OLD + "/0"}, _OLD, o) == [".a"],
+          "a longer name first does not hide a real hit later in the same string" + PIN)
+    check(find_embedded({"a": "x"}, "/", o) == [] and find_embedded("text", _OLD, o) == [],
+          "find_embedded ignores an empty old url and a bare scalar")
+    check(embedded_note("data", []) == []
+          and embedded_note("data", [".a"]) == ["data: old URL inside longer text at .a"]
+          and embedded_note("data", [".a", ".b", ".c"])
+          == ["data: old URL inside longer text at .a and 2 more"],
+          "embedded_note gives one line per document")
+
     deep = leaf = {}
     for _ in range(MAX_DEPTH + 5):
         leaf["k"] = {}
         leaf = leaf["k"]
     leaf["url"] = _OLD
     check(walk_replace(deep, _OLD, _NEW, o) == [], "a tree deeper than MAX_DEPTH stops, it does not crash")
+    check(find_embedded(deep, _OLD, o) == [], "find_embedded stops at MAX_DEPTH like the walk")
 
     # --- new_url is never treated as a regex replacement template ---
     evil = r"https://x/\g<0>/FeatureServer"
@@ -1816,6 +1940,8 @@ def _selftest_core(h):
     raises(lambda: validate_urls(host, host.replace("https", "http") + "/arcgis"),
            "nested detection sees through the scheme variant")
     raises(lambda: validate_urls(_OLD, _OLD + "/extra"), "new is old plus a path segment is refused")
+    raises(lambda: validate_urls(_OLD.replace("https", "http"), _OLD),
+           "a move that changes only the scheme is refused as nested, as the README says")
     for label, args in (("a rejected url", ("gis.example.org/x?token=TOK-1", _NEW)),
                         ("a nested pair", (host, host + "/arcgis?access_token=TOK-1"))):
         text = _exit_message(lambda a=args: validate_urls(*a))
@@ -1905,8 +2031,24 @@ def _selftest_csv(h):
           "redact blanks access_token")
     check(redact("TOKEN=abc") == "TOKEN=[redacted]" and redact("mytoken=abc") == "mytoken=abc",
           "redact matches a whole parameter name only")
-    check(redact("u?api_key=zzz&authToken=yyy") == "u?api_key=zzz&authToken=yyy",
-          "only token= and access_token= are blanked, other secret-like names are not")
+    check(redact("u?api_key=zzz&authToken=yyy") == "u?api_key=[redacted]&authToken=yyy",
+          "redact blanks api_key and keeps a name it does not list" + PIN)
+    for name in ("key", "apikey", "api_key", "oauth_token", "refresh_token", "id_token",
+                 "ticket", "password", "passwd", "pwd", "secret", "client_secret", "sig"):
+        check(redact("u?f=json&%s=SEC1&x=1" % name) == "u?f=json&%s=[redacted]&x=1" % name,
+              "redact blanks %s=" % name + PIN)
+    check(redact("u?token%3DSEC2%26f%3Djson") == "u?token%3D[redacted]%26f%3Djson"
+          and redact("u%3Fkey%3DSEC2") == "u%3Fkey%3D[redacted]",
+          "redact blanks an encoded token%3D and key%3D" + PIN)
+    check(redact("u#access_token=SEC3") == "u#access_token=[redacted]"
+          and redact("u?f=json;key=SEC3") == "u?f=json;key=[redacted]",
+          "redact blanks a fragment token and a ; separated key" + PIN)
+    check(redact("https://bob:SEC4@h.example.org/x") == "https://bob:[redacted]@h.example.org/x"
+          and redact("https://h.example.org:8443/x@y") == "https://h.example.org:8443/x@y"
+          and redact("https://bob@h.example.org/x") == "https://bob@h.example.org/x",
+          "redact blanks user:password@ and leaves a port and a bare user alone" + PIN)
+    check(redact("u?monkey=1&keys=2&sorted=key") == "u?monkey=1&keys=2&sorted=key",
+          "redact matches a whole parameter name only, key included")
     check(redact(7) == 7 and redact("no secrets here") == "no secrets here",
           "redact passes other values through")
     check(out_cell("a?token=SECRET")== "a?token=[redacted]" and out_cell("=a?token=SECRET") == "'=a?token=[redacted]",
@@ -2460,11 +2602,16 @@ def _scenario_secrets(cli, h):
     cli.org.items["k2"] = _item(
         "K two", _webmap(_OLD + "/1?token=" + _STUB_TOKEN),
         resources={"draft_3.json": json.dumps({"u": _OLD + "/2?token=" + _STUB_TOKEN})})
+    cli.org.items["k3"] = _item("K three", _webmap(
+        _OLD + "/3?key=" + _STUB_KEY, _OLD + "/4?f=json&apikey=" + _STUB_KEY,
+        _OLD + "/5#access_token=" + _STUB_KEY, _OLD + "/6?ticket=" + _STUB_KEY))
     cli.org.faults = {"k1/data": [(500, {})]}
     out_dir = cli.out_dir()
     r = cli.run(cli.base(["--apply", "--yes", "-v"], out_dir=out_dir))
     files = _tree_text(out_dir)
     blob = r.out + r.err + "".join(t for p, t in files)
+    check(_STUB_KEY not in blob and "key=[redacted]" in blob,
+          "a key=, apikey=, ticket= or fragment credential reaches no output file or the console" + PIN)
     check(_STUB_PASSWORD not in blob, "the password appears in no output file and not on the console" + PIN)
     check(_STUB_TOKEN not in blob,
           "no token appears in any output file, the backups included, or on the console" + PIN)
@@ -2474,7 +2621,7 @@ def _scenario_secrets(cli, h):
           "a backup holds the original data with the token value blanked" + PIN)
     check(dict(files).get("backups/resources/k2/draft_3.json") == json.dumps(
         {"u": _OLD + "/2?token=[redacted]"}), "a resource backup has its token blanked too" + PIN)
-    check("backup of k2 has 1 token= value(s) blanked" in r.out and _STUB_TOKEN not in r.out,
+    check("backup of k2 has 1 credential value(s) blanked" in r.out and _STUB_TOKEN not in r.out,
           "the run says a backup has a token blanked, without printing it" + PIN)
     mode = os.stat(os.path.join(out_dir, "backups", "k2.json")).st_mode & 0o077
     check(os.name == "nt" or mode == 0,
@@ -2485,6 +2632,34 @@ def _scenario_secrets(cli, h):
           and cli.org.items["k2"]["resources"]["draft_3.json"] == json.dumps(
               {"u": _OLD + "/2?token=" + _STUB_TOKEN}),
           "a run with the two urls swapped restores the item with its token intact")
+
+
+def _scenario_embedded(cli, h):
+    """An old url inside longer text is reported, never called clean."""
+    check = h.check
+    popup = {"popupInfo": {"description": "<img src=\"%s/0/images/a1\">" % _OLD}}
+    cli.org.items["e1"] = _item("Popup", dict(_webmap(_OLD + "/0"), **popup))
+    cli.org.items["e2"] = _item("Popup only", popup)
+    cli.org.items["e3"] = _item("Resource", _webmap(_OTHER), resources={
+        "draft_1.json": json.dumps({"text": "go to %s/1 now" % _OLD})})
+    cli.org.items["e4"] = _item("Clean", _webmap(_OTHER))
+    out_dir = cli.out_dir()
+    r = cli.run(cli.base(["-v"], out_dir=out_dir))
+    check(r.code == 3, "a dry run that finds an old url inside longer text exits 3, got %r" % (r.code,) + PIN)
+    check("UNREAD: 3 item(s)" in r.out, "the three items with embedded urls are counted, the clean one is not" + PIN)
+    check("e2  data: old URL inside longer text at .popupInfo.description" in r.out
+          and "e3  resource draft_1.json: old URL inside longer text at [resource:draft_1.json].text" in r.out
+          and "e4" not in r.out.split("UNREAD")[1],
+          "each item is listed with the path of the embedded url" + PIN)
+    check(cli.org.writes() == [], "the report writes nothing to the org")
+    r = cli.run(cli.base(["--apply", "--yes"], out_dir=cli.out_dir()))
+    check(r.code == 3 and cli.org.items["e1"]["data"]["operationalLayers"][0]["url"] == _NEW + "/0"
+          and "images/a1" in json.dumps(cli.org.items["e1"]["data"]["popupInfo"])
+          and _OLD in json.dumps(cli.org.items["e1"]["data"]["popupInfo"]),
+          "an applied run rewrites the leading urls, leaves the embedded one, and still exits 3" + PIN)
+    r = cli.run(cli.base(["--apply", "--yes"], old=_OTHER + "/zz", new=_OTHER + "/yy",
+                         out_dir=cli.out_dir()))
+    check(r.code == 0, "a run whose old url is nowhere in the org stays clean, exit 0")
 
 
 def _scenario_unsafe_name(cli, h):
@@ -2526,6 +2701,7 @@ def _selftest_io(h):
                                ("volume", _scenario_volume), ("options", _scenario_options),
                                ("cli", _scenario_cli),
                                ("secrets", _scenario_secrets),
+                               ("embedded", _scenario_embedded),
                                ("unsafe", _scenario_unsafe_name)):
             cli = _Cli(_StubOrg(), os.path.join(tmp, name))
             os.makedirs(cli.workdir)
@@ -2696,7 +2872,7 @@ def _selftest_units(h, tmp):
     doc = {"a": ["https://h/y?access_token=BBB", 5, None], "s": inner, "n": {"k": "plain"}}
     safe, n = redact_doc(doc)
     check(n == 2 and "AAA" not in json.dumps(safe) and "BBB" not in json.dumps(safe),
-          "redact_doc blanks every token= value in nested lists, dicts and strings" + PIN)
+          "redact_doc blanks every credential value in nested lists, dicts and strings" + PIN)
     check(json.loads(safe["s"]) == {"u": "https://h/x?token=[redacted]&f=json"},
           "a token inside a string that holds JSON leaves that JSON valid" + PIN)
     check(doc["a"][0].endswith("BBB") and safe["a"][1:] == [5, None] and safe["n"] == {"k": "plain"},
@@ -2719,12 +2895,15 @@ def _selftest_units(h, tmp):
     sys.modules["arcgis"], sys.modules["arcgis.gis"] = fake, fake_gis
     try:
         text = _exit_message(lambda: connect("https://h.example.org/portal?token=ORG-TOK-3", "u", "p"))
+        text_pw = _exit_message(lambda: connect("https://bob:ORG-PW-5@h.example.org/portal", "u", "p"))
     finally:
         for k in saved:
             sys.modules.pop(k, None)
         sys.modules.update(dict((k, v) for k, v in saved.items() if v is not None))
     check(text.startswith("Could not sign in") and "ORG-TOK-3" not in text and "token=[redacted]" in text,
           "a sign-in failure does not echo a token in the organization url" + PIN)
+    check("ORG-PW-5" not in text_pw and "bob:[redacted]@h.example.org" in text_pw,
+          "a sign-in failure does not echo a password in the organization url" + PIN)
 
     # scan_org: a service item that the search returns without the flag is reported
     svc_page = [{"total": 1, "nextStart": -1,
@@ -2738,10 +2917,15 @@ def _selftest_units(h, tmp):
           "a service item returned without --include-item-url is listed unread, so the run exits 3" + PIN)
     check(_exit_message(lambda: None) == "", "_exit_message returns empty text when nothing is raised")
 
-    # redact leaves the forms the README lists as not blanked
-    passthrough = "a?oauth_token=1&refresh_token=2&token%3D3&ticket=4&password=5&api_key=6 token=7"
-    check(redact(passthrough) == passthrough and redact(7) == 7,
-          "redact blanks only token= and access_token= query parameters, as the README says")
+    # redact leaves free text and JSON key names alone, as the README says
+    passthrough = "text token=7 and a note: the key is under the mat"
+    check(redact(passthrough) == passthrough,
+          "redact leaves a token= that is not part of a query string, as the README says")
+    check(redact_doc({"customParameters": {"token": "SEC5"}}) == (
+        {"customParameters": {"token": "SEC5"}}, 0),
+          "a secret held under a JSON key name, not in a query string, is not blanked")
+    check(redact_doc({"u": "a?key=SEC6&password=SEC7"})[1] == 2,
+          "redact_doc counts each credential value it blanks" + PIN)
 
     # a backup written over an old file keeps the old file's mode (POSIX)
     reused = Path(tmp) / "reused.json"

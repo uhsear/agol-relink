@@ -20,8 +20,9 @@ published copy is fixed. Their working draft is a separate file in the item's re
 still holds the old URL. The next time an author opens the draft, the old URL is in it again.
 
 This tool walks the whole JSON tree of each item and its JSON resources. It rewrites every string that
-starts with the old service URL, at a URL boundary. It writes a report first, and it writes to the
-organization only when you pass `--apply`.
+starts with the old service URL, at a URL boundary. It also looks for the old URL inside longer text
+(pop-up HTML, story text, an encoded `url=` parameter) and reports each such item, because it does not
+rewrite those. It writes a report first, and it writes to the organization only when you pass `--apply`.
 
 ## What already exists
 
@@ -118,8 +119,8 @@ A run without `--out-dir` writes a timestamped directory. With `--out-dir`, it w
 |---|---|
 | `changes.csv` | one row per URL: item, title, type, owner, status, JSON path, before, after, error. A skipped item, or a failed item that found no URL, gets one row with the three URL columns empty. A failed item that found a URL before it failed keeps one row per URL, status `failed`, with before and after filled in. The after value is what the rewrite would have been: do not read it as written. |
 | `run.log` | full log, including library chatter kept off your screen, and one `unread` line for every item with data or resources the tool did not read |
-| `backups/<itemid>.json` | the item's original data JSON, saved before any write, with each `token=` value blanked |
-| `backups/resources/<itemid>/` | original resource JSON, with each `token=` value blanked |
+| `backups/<itemid>.json` | the item's original data JSON, saved before any write, with each credential value blanked (see "Tokens in URLs") |
+| `backups/resources/<itemid>/` | original resource JSON, with each credential value blanked |
 | `updated_ids.txt` | ids confirmed written. Feed the directory to `--resume` after a crash |
 
 A dry run writes `changes.csv`, `run.log` and an empty `backups` directory, all on your disk. The self-test
@@ -132,7 +133,7 @@ shows that a dry run sends no write request to the organization.
 | 0 | the search returned at least one item and every item the server reported, no item failed, and every item's data and resources were read |
 | 1 | refused or aborted: bad URLs, no `APPLY` typed, sign-in failed, `arcgis` missing or broken, or an unexpected error ended the run. After an unexpected error, items may already be written: read `updated_ids.txt`. |
 | 2 | at least one item failed. This code also means a command-line usage error. |
-| 3 | the scan was incomplete: the server reported more items than it returned, `--max-items` stopped the scan before the last item, the search returned no item at all, an item carries data or a resource this tool did not read, or `--no-resources` was set |
+| 3 | the scan was incomplete: the server reported more items than it returned, `--max-items` stopped the scan before the last item, the search returned no item at all, an item carries data or a resource this tool did not read, an item holds the old URL inside longer text, or `--no-resources` was set |
 
 A clean result with exit 3 does not cover the items the search did not return, nor the data or resources
 the tool did not read. The console lists the first 15 such items at the end, with up to five resource names
@@ -140,6 +141,12 @@ each. `run.log` has an `unread` line for every one of them, with all the names. 
 search printed a warning and exited 0, and an unchanged item with a binary resource was not mentioned.
 An organization with `.xlsx` or `.zip` resources on its StoryMaps will see exit 3 on every run.
 That is the intended signal: the tool cannot read those files.
+
+An item that holds the old URL inside longer text is listed the same way, with the JSON path of the first
+such string: `data: old URL inside longer text at .popupInfo.description`. The status of the item stays
+`clean` or `matched`, because the tool rewrote nothing there. The run exits 3, so a wrapper does not read
+the item as done. A dry run that finds URLs to rewrite exits 0, because only a failure or an unfinished
+scan changes the exit code. Read `changes.csv` to tell "URLs found" from "nothing found".
 
 ### Spreadsheet safety
 
@@ -159,14 +166,14 @@ then `=` is not guarded either.
 ### Tokens in URLs
 
 A web map can hold a signed URL, and a library error message repeats the request URL.
-The value of a `token=` or `access_token=` parameter is replaced with `[redacted]` in `changes.csv`,
+The value of a credential parameter is replaced with `[redacted]` in `changes.csv`,
 in `run.log`, on the console and in the backups. The tool blanks each string of the parsed JSON, not the
 dumped text, so a token inside a string that holds more JSON leaves that JSON valid. The self-test searches
 every file of a run, the backups included, and the console for the session token. It finds none.
 A URL you type that fails the check, and an organization URL in a sign-in error, are blanked the same way.
 
 The price is in the backups. A rollback from a backup writes `[redacted]` where a token stood.
-The run says so with `backup of <itemid> has N token= value(s) blanked` and never prints the value.
+The run says so with `backup of <itemid> has N credential value(s) blanked` and never prints the value.
 The tool leaves the token in the item itself, because it changes only the start of each URL. To undo a
 relink and keep the tokens, run the tool again with the two URLs swapped (`--old-url` the new one,
 `--new-url` the old one). The self-test does this and checks that data and a resource come back with
@@ -176,9 +183,13 @@ only the read-only flag and ignores the other bits. On Windows the folder's acce
 read a backup. A reused `--out-dir` keeps the mode of an old backup file, because the file is truncated and
 not created again.
 
-Only `token=` and `access_token=` parameters are blanked. A token in free error text that is not part of
-a query string is not blanked. Other forms pass through: `token%3D`, `oauth_token=`, `refresh_token=`,
-`api_key=`, `ticket=` and `password=`.
+The parameter names are `token`, `access_token`, `oauth_token`, `refresh_token`, `id_token`, `api_key`,
+`apikey`, `key`, `ticket`, `password`, `passwd`, `pwd`, `secret`, `client_secret` and `sig`, in any letter case.
+The whole name must match, so `authToken=` and `monkey=` stay. The name may follow `?`, `&`, `;`, `#` or an
+encoded `?` or `&`, and the equals sign may be `%3D`. The value of `user:password@host` in a URL is blanked too.
+A secret in free text that is not part of a query string is not blanked. A secret under a JSON key name, such as
+`"customParameters": {"token": "..."}`, is not blanked either, because the tool cannot tell a secret from other data
+there. The backup, and `changes.csv` for a URL that starts with the old URL, keep such a value as the item holds it.
 A traceback from an unexpected error goes to `run.log` with the same blanking. With `-v` it also reaches the
 console, blanked.
 
@@ -242,6 +253,11 @@ configuration in `config/config.json`. Both facts come from the source of the `a
 Patch `/data` alone and the draft still holds the old URL. This tool patches both, and takes a
 backup of each resource first. Turn it off with `--no-resources` if you have a reason.
 
+After the walk, a second read-only pass looks for the old URL anywhere else in each string and in each
+dictionary key. It also looks for the percent-encoded form, in either hex case. A hit counts only at a name
+boundary: the next character must not continue a host or path name, so `.../MapServer2` and
+`.../MapServer.evil.org` are not hits. The pass changes nothing. It makes the item an unread item, and the run exits 3.
+
 ## What it relies on in Esri's products
 
 Each line below was checked against Esri's documentation or the `arcgis` 2.4.2 source.
@@ -276,7 +292,8 @@ external `choices` sheet. This tool cannot see it. Plain images (`.png`, `.jpg`,
 neither read nor listed.
 
 **URLs inside a longer string.** Only values that start with the old URL are rewritten. An `href`
-inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL is not rewritten.
+inside pop-up HTML stays, and so does a dictionary key that holds the old URL. The tool finds these and
+reports the item (exit 3), so you can fix them by hand, but it does not rewrite them. Ports count.
 
 **Items the search does not return.** See exit status 3 above.
 
@@ -307,7 +324,7 @@ inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL i
 - `--resume` trusts the `updated_ids.txt` of any directory, so a directory from a run with other URLs skips items that this pair never changed.
 - A search that names `orgid:<id>` was exercised against the stub only. A Portal that ignores `orgid:` would return no items, and the run would exit 3 with `scanned 0 items`.
 - An `http://` value for `--org` is accepted, and the sign-in then travels without encryption. Use `https://`.
-- The tool also guards a leading line feed in a text cell, which the OWASP mitigation does not list. Text that starts with another control character, such as a vertical tab, is not guarded.
+- The apostrophe prefix is applied only when the first character is a formula lead. Text that starts with a space or a vertical tab and then `=` is not guarded.
 - A UTF-8 byte order mark at the start of item data or of a `.json` resource makes the item fail with `is not JSON`. The failure is loud, not a clean result.
 - Under `--apply` on Windows, a resource name that holds a character the file system forbids, such as `*`, ends the run with exit 1 at the backup write, because the backup file name is built from the resource name. `safe_backup_name` rejects only a backslash, a colon, a leading slash and a `..` segment. An item id is used in a backup file name unchecked.
 - A resource name goes into the request path unquoted. A name with `#`, `?` or `%` reads another path, and the item fails with exit 2 instead of being read.
@@ -316,7 +333,9 @@ inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL i
 - `--yes=hunter2` makes `argparse` print `ignored explicit argument 'hunter2'`: only the `unrecognized arguments` error hides values. A stray argument that begins with `--` is printed as typed, so a secret that begins with `--` would show.
 - The password prompt runs before the URL and `--types` checks, so a bad flag value is reported after you type the password.
 - Exit 1 covers both a refusal (no `APPLY` typed, bad URLs) and an unexpected error that may follow writes. A wrapper script cannot tell them apart without `run.log`.
-- Only `token=` and `access_token=` values are blanked. `key=`, `apikey=` and `user:password@` in a URL pass through into `changes.csv`, `run.log` and the backups.
+- A resource listing entry whose `resource` value is not a string ends the run with exit 1 and writes no `changes.csv`. An entry with no `resource` key is skipped and not listed as unread. Esri always sends a string.
+- A move that changes only the scheme, such as `http://` to `https://` on the same path, is refused as nested under the old URL, because the match ignores the scheme by default. Nothing is written. Set `ANY_SCHEME` to `False` in the `CONFIGURATION` block to allow it. The `--strict-scheme` flag does not lift the refusal.
+- The Esri quotes in "What it relies on in Esri's products" are exact except for the capital letters: the page writes "Multipart" and "Text input", and this README lowercases them.
 
 ## Notes
 
@@ -337,7 +356,7 @@ inside pop-up HTML stays. Ports count. A dictionary key that holds the old URL i
 
 ## Testing
 
-`--self-test` runs 300 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 356 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -355,6 +374,9 @@ PASS  changes.csv title guards a leading '=' and nothing else  <-- pinned defect
 PASS  a dry run sends no write request to the org  <-- pinned defect
 ...
 PASS  a token in a matched url is blanked in changes.csv  <-- pinned defect
+...
+PASS  a dry run that finds an old url inside longer text exits 3, got 3  <-- pinned defect
+PASS  each item is listed with the path of the embedded url  <-- pinned defect
 ...
 PASS  a text resource that is not .json is listed as unread and not scanned  <-- pinned defect
 ...
@@ -383,6 +405,7 @@ PASS  there is no --password flag: it is refused and its value is not echoed  <-
 ...
 PASS  the password appears in no output file and not on the console  <-- pinned defect
 PASS  no token appears in any output file, the backups included, or on the console  <-- pinned defect
+PASS  a key=, apikey=, ticket= or fragment credential reaches no output file or the console  <-- pinned defect
 ...
 PASS  a backup holds the original data with the token value blanked  <-- pinned defect
 ...
@@ -391,7 +414,7 @@ PASS  a raw read asks for the response, so the library saves no file to the temp
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-300 assertions, 0 failed
+356 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -407,7 +430,8 @@ The self-test covers:
 - the incomplete-scan exit, the unread-item exit, the exit for a search that returns nothing, a resource list of several pages, `--max-items` with and without items left over, and `--include-item-url`
 - prompts, environment variables, the `CONFIGURATION` block, a wrong password, a missing `arcgis` package,
   and an `arcgis` import that fails on the ArcGIS Pro licence
-- a search of every output file, the backups included, and of the console, for the password and the session token, with an item whose data and resource both carry a `token=`
+- a search of every output file, the backups included, and of the console, for the password, the session token and a `key=`, `apikey=`, `ticket=` or fragment credential, with an item whose data and resource both carry a `token=`
+- an old URL inside pop-up HTML, in a resource and in an encoded form: the run lists the item and exits 3, and the boundary rule that keeps `.../MapServer2` out
 - a dry run against a stub that saves every raw read made without `return_raw_response` to a temp folder, and a check that the folder stays empty
 - a stub that answers an item-data read with `503` and an HTML body, with `502` and no body, and with `404`: the first is retried, the others fail the item
 - the refusal of a service type without `--include-item-url`, of `--no-resources` as a clean run, and of a resource name that points out of `backups/`
@@ -417,18 +441,18 @@ Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 300 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 300 |
-| Windows | 3.9.25 | 300 |
-| Windows | 3.12 | 300 |
-| Linux | 3.12.3 | 300 |
+| Windows | 3.13.2 (`C:\Python313`) | 356 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 356 |
+| Windows | 3.9.25 | 356 |
+| Windows | 3.12 | 356 |
+| Linux | 3.12.3 | 356 |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`. The permission-mode
 assertions pass trivially on Windows, where they test nothing. They run for real on Linux.
 
 Branch coverage was measured with `coverage run --branch agol_relink.py --self-test` on Windows, with
 coverage.py 7.16.1 on a Python 3.13 virtual environment: 100% of
-1662 statements and 344 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
+1761 statements and 374 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
 guard, whose false side only happens on import. The self-test code is part of the measured file.
 
 ### What the self-test does not cover
