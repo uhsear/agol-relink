@@ -323,10 +323,24 @@ def redact(text: Any) -> Any:
     return _USERINFO_RE.sub(r"\1[redacted]", _TOKEN_RE.sub(r"\1[redacted]", text))
 
 
+# JSON key names whose string value is a credential. "key" and "sig" are left
+# out: as JSON keys they hold ordinary data far more often than a secret.
+# A key is compared in lower case with "_" and "-" removed, so apiKey, api_key
+# and API-KEY are one name.
+_SECRET_KEYS = frozenset((
+    "token", "accesstoken", "oauthtoken", "refreshtoken", "idtoken", "apikey",
+    "ticket", "password", "passwd", "pwd", "clientsecret", "secret"))
+
+
+def _is_secret_key(key: Any) -> bool:
+    return isinstance(key, str) and key.lower().replace("_", "").replace("-", "") in _SECRET_KEYS
+
+
 def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
     """A copy of a JSON document with every credential value blanked, and the count.
 
-    It works on the parsed strings, not on the dumped text, so a token inside
+    A string under a key named in _SECRET_KEYS is blanked whole. Every other
+    string is blanked by redact(). It works on the parsed strings, not on the dumped text, so a token inside
     a string that holds more JSON cannot swallow the escaping quote. Past
     MAX_DEPTH the subtree is copied as it is, the same limit walk_replace has.
     """
@@ -338,7 +352,10 @@ def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
     if isinstance(node, dict):
         out_map: dict = {}
         for k, v in node.items():
-            out_map[k], n = redact_doc(v, depth + 1)
+            if _is_secret_key(k) and isinstance(v, str) and v:
+                out_map[k], n = "[redacted]", 1
+            else:
+                out_map[k], n = redact_doc(v, depth + 1)
             total += n
         return out_map, total
     out_list: list = []
@@ -618,8 +635,9 @@ def write_backup(path: Path, item_id: str, doc: Any) -> None:
     """Save the original JSON of an item or resource, token= values blanked.
 
     A backup keeps the item's own data, which can carry a signed URL. The
-    tokens are blanked, so no output file holds one. A rollback from a backup
-    puts back "[redacted]" where a token stood. The file mode is 0600 where
+    tokens are blanked, so no output file holds one. A string under a key such
+    as token or apiKey is blanked too. A rollback from a backup puts back
+    "[redacted]" where a token stood. The file mode is 0600 where
     the system honours it.
     """
     safe, n = redact_doc(doc)
@@ -1137,8 +1155,16 @@ def scan_org(gis, args, old: str, new: str, opts: MatchOpts, apply: bool,
 
 
 def write_changes(csv_path: Path, results: list[Result]) -> None:
-    with csv_path.open("w", newline="", encoding="utf-8") as fh:
-        csv.writer(fh).writerows(csv_rows(results))
+    """Write the report in one piece. The text is encoded before the file is opened.
+
+    A character UTF-8 cannot encode (a lone surrogate) then fails with no file
+    touched, so a header-only changes.csv never stands in for a report.
+    """
+    buf = io.StringIO(newline="")
+    csv.writer(buf).writerows(csv_rows(results))
+    data = buf.getvalue().encode("utf-8")
+    with csv_path.open("wb") as fh:
+        fh.write(data)
 
 
 def log_summary(scan: Scan, csv_path: Path, apply: bool) -> None:
@@ -1150,6 +1176,9 @@ def log_summary(scan: Scan, csv_path: Path, apply: bool) -> None:
             log.info("  %-8s %d", k, scan.counts[k])
     log.info("  %-8s %d", "urls", total_urls)
     log.info("report : %s", csv_path.resolve())
+    log.info("note   : a search returns only items the signed-in account can "
+             "access. Private items of other members are not scanned and are "
+             "not in the count above, so exit 0 does not cover them.")
     if scan.unread_items:
         log.warning("")
         log.warning("%d item(s) carry data or resources this tool did not read, "
@@ -2370,6 +2399,9 @@ def _scenario_enumeration(cli, h):
     full = cli.run(cli.base())
     check(full.code == 0 and "scanned 5 items" in full.out,
           "paging in pages of 2 reaches all 5 items")
+    check("Private items of other members are not scanned" in full.out
+          and "exit 0 does not cover them" in full.out,
+          "every run says that private items of other members are not scanned" + PIN)
     cli.org.total_override = 7
     short = cli.run(cli.base())
     check(short.code == 3 and "enumerated 5 of 7" in short.out and "INCOMPLETE" in short.out,
@@ -2917,15 +2949,32 @@ def _selftest_units(h, tmp):
           "a service item returned without --include-item-url is listed unread, so the run exits 3" + PIN)
     check(_exit_message(lambda: None) == "", "_exit_message returns empty text when nothing is raised")
 
-    # redact leaves free text and JSON key names alone, as the README says
+    # redact leaves free text alone, as the README says; a secret key name is blanked
     passthrough = "text token=7 and a note: the key is under the mat"
     check(redact(passthrough) == passthrough,
           "redact leaves a token= that is not part of a query string, as the README says")
-    check(redact_doc({"customParameters": {"token": "SEC5"}}) == (
-        {"customParameters": {"token": "SEC5"}}, 0),
-          "a secret held under a JSON key name, not in a query string, is not blanked")
+    check(redact_doc({"customParameters": {"token": "SEC5"}, "note": "text token=7"}) == (
+        {"customParameters": {"token": "[redacted]"}, "note": "text token=7"}, 1),
+          "a secret held under a JSON key name is blanked, free text beside it is not" + PIN)
     check(redact_doc({"u": "a?key=SEC6&password=SEC7"})[1] == 2,
           "redact_doc counts each credential value it blanks" + PIN)
+    keyed, kn = redact_doc({"a": [{"apiKey": "K1", "API-KEY": "K2", "api_key": "K3"}],
+                            "Password": "K4", "client_secret": "K5", "n": {"idToken": "K6"}})
+    check(kn == 6 and not any(("K%d" % i) in json.dumps(keyed) for i in range(1, 7)),
+          "apiKey, API-KEY, api_key, Password, client_secret and idToken are blanked, in lists too" + PIN)
+    plain_keys = {"key": "k", "sig": "s", "token": 5, "secret": "", "pwd": None, "authToken": "a"}
+    check(redact_doc(plain_keys) == (plain_keys, 0),
+          "key, sig, authToken, and a non-string or empty value under a secret name stay as they are")
+    sec_bak = Path(tmp) / "secret_bak.json"
+    write_backup(sec_bak, "sk1", {"config": {"apiKey": "AAPK-R1", "customParameters": {"token": "SEC-R2"}}})
+    sec_text = sec_bak.read_text(encoding="utf-8")
+    check("AAPK-R1" not in sec_text and "SEC-R2" not in sec_text and sec_text.count("[redacted]") == 2,
+          "a backup holds no secret that sat under a JSON key name" + PIN)
+    sur_csv = Path(tmp) / "surrogate_changes.csv"
+    h.raises(lambda: write_changes(sur_csv, [Result("s1", "a" + chr(0xD800) + "b", "Web Map", "o", "failed", [], "x")]),
+             "a title UTF-8 cannot encode fails the report write", exc=UnicodeEncodeError)
+    check(not sur_csv.exists(),
+          "a failed report write leaves no header-only changes.csv behind" + PIN)
 
     # a backup written over an old file keeps the old file's mode (POSIX)
     reused = Path(tmp) / "reused.json"

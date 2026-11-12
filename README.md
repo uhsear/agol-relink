@@ -31,7 +31,7 @@ Esri ships two ways to do this. Use them when they fit.
 - **Update ArcGIS Server site references.** Open the web map's item page, then Settings, then Layer
   Settings. Esri's page says all ArcGIS Server layers that reference the site are updated, "as well as
   associated layer items you own or administer". The page adds a note: the layers at the replacement
-  site must exactly match the existing layers. The page is about web maps, and you must be the owner
+  site must exactly match the existing layers. The page starts from a web map, and you must be the owner
   or an administrator
   ([Update the URL of ArcGIS Server web layers in web maps](https://doc.esri.com/en/arcgis-online/latest/manage-data/update-web-service-urls-in-maps.html)).
   It is the right choice for one web map on a moved site.
@@ -136,7 +136,10 @@ shows that a dry run sends no write request to the organization.
 | 3 | the scan was incomplete: the server reported more items than it returned, `--max-items` stopped the scan before the last item, the search returned no item at all, an item carries data or a resource this tool did not read, an item holds the old URL inside longer text, or `--no-resources` was set |
 
 A clean result with exit 3 does not cover the items the search did not return, nor the data or resources
-the tool did not read. The console lists the first 15 such items at the end, with up to five resource names
+the tool did not read. Exit 0 does not cover them either. A search returns only the items the signed-in
+account can access, so a private item of another member is in neither the results nor the server's total,
+and nothing in the answer says it was left out. Every run therefore ends with a `note` line that says so.
+The tool does not tell an organization-wide viewer from an ordinary member. The console lists the first 15 such items at the end, with up to five resource names
 each. `run.log` has an `unread` line for every one of them, with all the names. Before this version, a short
 search printed a warning and exited 0, and an unchanged item with a binary resource was not mentioned.
 An organization with `.xlsx` or `.zip` resources on its StoryMaps will see exit 3 on every run.
@@ -187,9 +190,14 @@ The parameter names are `token`, `access_token`, `oauth_token`, `refresh_token`,
 `apikey`, `key`, `ticket`, `password`, `passwd`, `pwd`, `secret`, `client_secret` and `sig`, in any letter case.
 The whole name must match, so `authToken=` and `monkey=` stay. The name may follow `?`, `&`, `;`, `#` or an
 encoded `?` or `&`, and the equals sign may be `%3D`. The value of `user:password@host` in a URL is blanked too.
-A secret in free text that is not part of a query string is not blanked. A secret under a JSON key name, such as
-`"customParameters": {"token": "..."}`, is not blanked either, because the tool cannot tell a secret from other data
-there. The backup, and `changes.csv` for a URL that starts with the old URL, keep such a value as the item holds it.
+A secret in free text that is not part of a query string is not blanked.
+A string value under a JSON key is blanked in the backups, such as `"customParameters": {"token": "..."}` or
+`"apiKey": "..."`. The key names are `token`, `access_token`, `oauth_token`, `refresh_token`, `id_token`,
+`apikey`, `ticket`, `password`, `passwd`, `pwd`, `secret` and `client_secret`, compared in any letter case with
+`_` and `-` ignored, so `apiKey`, `api_key` and `API-KEY` are one name. `key` and `sig` are left out of this
+list, because as JSON keys they hold ordinary data far more often than a secret. A number, an empty string or
+a value that is not a string under one of these keys stays as it is. A rollback from a backup restores
+`[redacted]` for these values too.
 A traceback from an unexpected error goes to `run.log` with the same blanking. With `-v` it also reaches the
 console, blanked.
 
@@ -295,7 +303,9 @@ neither read nor listed.
 inside pop-up HTML stays, and so does a dictionary key that holds the old URL. The tool finds these and
 reports the item (exit 3), so you can fix them by hand, but it does not rewrite them. Ports count.
 
-**Items the search does not return.** See exit status 3 above.
+**Items the search does not return.** Exit status 3 above covers a server that reports more items than it
+returns. It does not cover a private item of another member: the search leaves it out of the results and out of
+the total, so the run exits 0 when everything it could see is clean. Every run prints a `note` line about this.
 
 **Smaller limits.**
 
@@ -315,7 +325,7 @@ reports the item (exit 3), so you can fix them by hand, but it does not rewrite 
 - A search that returns zero items logs `scanned 0 items` and exits 3, because nothing was checked. A mistyped `--types` such as `Storymap` gives this. A typo beside a valid name, as in `Web Map,Storymap`, still scans the valid name and exits 0 on a clean result. Check the `--types` spelling in the `query:` line.
 - A `--resume` directory that does not exist, or has no `updated_ids.txt`, resumes nothing and says nothing. Re-processing an updated item finds no match, so no harm follows.
 - A dry run that reuses an `--out-dir` overwrites the earlier `changes.csv`, which may be the record of an applied run.
-- A lone surrogate character in item JSON makes the backup write fail and ends the run with exit 1. A lone surrogate in an item title, owner or URL ends the run with exit 1 as well, at the `changes.csv` write, so no report is written. After `--apply` the writes are already made: read `updated_ids.txt`.
+- A lone surrogate character in item JSON makes the backup write fail and ends the run with exit 1. A lone surrogate in an item title, owner or URL ends the run with exit 1 as well, at the `changes.csv` write. The tool encodes the whole report before it opens the file, so no new `changes.csv` is written, and an old one in a reused `--out-dir` stays as it was. After `--apply` the writes are already made: read `updated_ids.txt`.
 - The raw item-data, resource-list and resource reads pass `return_raw_response=True` to `Connection.get`, which the `get` docstring lists, and check `status_code` themselves. In arcgis 2.4.2 the `force_bytes` path returns the body of an HTTP error without a status check, which is why the tool does not use it. This was read from the source of that version, not tried against a live organization.
 - Five observations in this README come from hand checks and are not covered by the self-test: the hand check of the write path on a live organization, the 13 JSON paths in one organization, the October 2026 `text=` sanitizing, the cp1252 console logging error, and the `PYTHONUTF8=1` advice for it.
 - A closed stdin at the `APPLY` prompt, or at the `Username` prompt, ends the run with exit 1. At the `APPLY` prompt nothing is written. At the `Username` prompt the run has not started.
@@ -327,7 +337,14 @@ reports the item (exit 3), so you can fix them by hand, but it does not rewrite 
 - The apostrophe prefix is applied only when the first character is a formula lead. Text that starts with a space or a vertical tab and then `=` is not guarded.
 - A UTF-8 byte order mark at the start of item data or of a `.json` resource makes the item fail with `is not JSON`. The failure is loud, not a clean result.
 - Under `--apply` on Windows, a resource name that holds a character the file system forbids, such as `*`, ends the run with exit 1 at the backup write, because the backup file name is built from the resource name. `safe_backup_name` rejects only a backslash, a colon, a leading slash and a `..` segment. An item id is used in a backup file name unchecked.
-- A resource name goes into the request path unquoted. A name with `#`, `?` or `%` reads another path, and the item fails with exit 2 instead of being read.
+- A resource name goes into the request path unquoted. A name with `#` or `?`, or with a `%` that forms an escape such as `%41`, reads another path, and the item fails with exit 2 instead of being read. A plain `%`, as in `a%b.json`, reads fine.
+- A credential parameter whose name is not in the listed names, such as `api-key`, `signature` or `jwt`, is written to every output file as the item holds it.
+- A value that starts with a listed name and an equals sign, such as a filter `TICKET=1234`, is blanked in the backup, and a rollback from it restores `[redacted]`.
+- Close any open `changes.csv` before a run that reuses `--out-dir`. The tool opens the report only after the items are written, so a file that Excel holds open ends an `--apply` run with exit 1 and no report. `updated_ids.txt` and the backups survive.
+- A value stored without a scheme, or as `//host/path`, is not matched, rewritten or reported.
+- The tool does not check that an item is unchanged between the read and the `--apply` write, so an edit made by its owner in that window is overwritten with the older data.
+- The tool writes the whole item JSON again. Number formatting and duplicate keys of the original can change, and a number such as `1e400` is written as `Infinity`.
+- An invalid value for a known flag is printed by `argparse`: `--max-items hunter2` prints `invalid int value: 'hunter2'`. Only the `unrecognized arguments` error hides values.
 - A resource list whose `nextStart` is not a number, or does not advance, ends with the entries read so far and no warning. A search answer without a `total` skips the incomplete-scan check.
 - A JSON tree that nests deeper than 200 levels is not scanned below that depth, and a token below that depth is not blanked in a backup. The item is reported clean with exit 0.
 - `--yes=hunter2` makes `argparse` print `ignored explicit argument 'hunter2'`: only the `unrecognized arguments` error hides values. A stray argument that begins with `--` is printed as typed, so a secret that begins with `--` would show.
@@ -356,7 +373,7 @@ reports the item (exit 3), so you can fix them by hand, but it does not rewrite 
 
 ## Testing
 
-`--self-test` runs 356 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 362 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -389,6 +406,7 @@ PASS  a resource is written as an uploaded file, never as text=  <-- pinned defe
 ...
 PASS  a resource list that answers 200 with an error body fails the item, it is not an empty list  <-- pinned defect
 ...
+PASS  every run says that private items of other members are not scanned  <-- pinned defect
 PASS  a server that reports 7 but returns 5 exits 3, not 0  <-- pinned defect
 ...
 PASS  --max-items that leaves items unexamined exits 3 and says so, not exit 0  <-- pinned defect
@@ -409,12 +427,18 @@ PASS  a key=, apikey=, ticket= or fragment credential reaches no output file or 
 ...
 PASS  a backup holds the original data with the token value blanked  <-- pinned defect
 ...
+PASS  a secret held under a JSON key name is blanked, free text beside it is not  <-- pinned defect
+...
+PASS  a backup holds no secret that sat under a JSON key name  <-- pinned defect
+...
+PASS  a failed report write leaves no header-only changes.csv behind  <-- pinned defect
+...
 PASS  a raw read asks for the response, so the library saves no file to the temp folder and the tool sees the status  <-- pinned defect
 ...
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-356 assertions, 0 failed
+362 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -430,6 +454,7 @@ The self-test covers:
 - the incomplete-scan exit, the unread-item exit, the exit for a search that returns nothing, a resource list of several pages, `--max-items` with and without items left over, and `--include-item-url`
 - prompts, environment variables, the `CONFIGURATION` block, a wrong password, a missing `arcgis` package,
   and an `arcgis` import that fails on the ArcGIS Pro licence
+- a backup that holds a secret under a JSON key such as `apiKey`, a title that UTF-8 cannot encode, and the `note` line about private items of other members
 - a search of every output file, the backups included, and of the console, for the password, the session token and a `key=`, `apikey=`, `ticket=` or fragment credential, with an item whose data and resource both carry a `token=`
 - an old URL inside pop-up HTML, in a resource and in an encoded form: the run lists the item and exits 3, and the boundary rule that keeps `.../MapServer2` out
 - a dry run against a stub that saves every raw read made without `return_raw_response` to a temp folder, and a check that the folder stays empty
@@ -441,18 +466,18 @@ Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 356 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 356 |
-| Windows | 3.9.25 | 356 |
-| Windows | 3.12 | 356 |
-| Linux | 3.12.3 | 356 |
+| Windows | 3.13.2 (`C:\Python313`) | 362 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 362 |
+| Windows | 3.9.25 | 362 |
+| Windows | 3.12 | 362 |
+| Linux | 3.12.3 | 362 |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`. The permission-mode
 assertions pass trivially on Windows, where they test nothing. They run for real on Linux.
 
 Branch coverage was measured with `coverage run --branch agol_relink.py --self-test` on Windows, with
 coverage.py 7.16.1 on a Python 3.13 virtual environment: 100% of
-1761 statements and 374 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
+1782 statements and 376 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
 guard, whose false side only happens on import. The self-test code is part of the measured file.
 
 ### What the self-test does not cover
