@@ -337,11 +337,20 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - The apostrophe prefix is applied only when the first character is a formula lead. Text that starts with a space or a vertical tab and then `=` is not guarded.
 - A UTF-8 byte order mark at the start of item data or of a `.json` resource makes the item fail with `is not JSON`. The failure is loud, not a clean result.
 - Under `--apply` on Windows, a resource name that holds a character the file system forbids, such as `*`, ends the run with exit 1 at the backup write, because the backup file name is built from the resource name. `safe_backup_name` rejects only a backslash, a colon, a leading slash and a `..` segment. An item id is used in a backup file name unchecked.
-- A resource name goes into the request path unquoted. A name with `#` or `?`, or with a `%` that forms an escape such as `%41`, reads another path, and the item fails with exit 2 instead of being read. A plain `%`, as in `a%b.json`, reads fine.
+- A resource name goes into the request path unquoted. A name with `#` or `?`, or with a `%` that forms an escape such as `%41`, reads another path, and the item fails with exit 2 or reads a different existing resource instead. A plain `%`, as in `a%b.json`, reads fine.
 - A credential parameter whose name is not in the listed names, such as `api-key`, `signature` or `jwt`, is written to every output file as the item holds it.
 - A value that starts with a listed name and an equals sign, such as a filter `TICKET=1234`, is blanked in the backup, and a rollback from it restores `[redacted]`.
 - Close any open `changes.csv` before a run that reuses `--out-dir`. The tool opens the report only after the items are written, so a file that Excel holds open ends an `--apply` run with exit 1 and no report. `updated_ids.txt` and the backups survive.
 - A value stored without a scheme, or as `//host/path`, is not matched, rewritten or reported.
+- A URL that writes the default port, such as `:443`, does not match the same URL without it. It is neither rewritten nor reported, and the run exits 0.
+- A credential parameter named `client-secret` is not blanked, like `api-key`. A JSON key outside the list, such as `bingKey`, and a header such as `Authorization: Bearer ...`, are written as the item holds them.
+- A secret-named JSON key is blanked only when its value is a string. A dictionary under `token`, such as `{"token": {"value": "X"}}`, keeps its inner string in the backup.
+- In a `user:password@host` URL, a password that holds a literal `@` is blanked only up to the first `@`. Percent-encode the password in the URL.
+- A 200 answer with an empty body is read as `{}`, so the item counts as clean with no data.
+- A search answer whose `nextStart` is a string raises a `TypeError` in the item walk and ends the run with exit 1. Esri always sends an integer.
+- Python 3.9 prints `ResourceWarning` lines for unclosed files when the self-test runs with `-W error`. The module itself compiles clean under `-W error`.
+- The tool writes `changes.csv` and `run.log` with the default file mode. Only the backups use mode 0600. These two files hold titles, owners and redacted URLs, so set a restrictive `umask` on a shared Linux host.
+- The self-test excerpt in "Testing" shows lines from a real run in an order that differs from the run in three places.
 - The tool does not check that an item is unchanged between the read and the `--apply` write, so an edit made by its owner in that window is overwritten with the older data.
 - The tool writes the whole item JSON again. Number formatting and duplicate keys of the original can change, and a number such as `1e400` is written as `Infinity`.
 - An invalid value for a known flag is printed by `argparse`: `--max-items hunter2` prints `invalid int value: 'hunter2'`. Only the `unrecognized arguments` error hides values.
