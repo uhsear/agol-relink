@@ -297,7 +297,9 @@ def embedded_note(label: str, paths: list[str]) -> list[str]:
 # --------------------------------------------------------------------------
 # Whole parameter names only: "mytoken=" and "authToken=" are not matched.
 _SECRET_NAMES = ("access_token|oauth_token|refresh_token|id_token|token|api_key|apikey|key"
-                 "|ticket|password|passwd|pwd|client_secret|secret|sig")
+                 "|ticket|password|passwd|pwd|client_secret|client-secret|secret|sig|signature"
+                 "|api-key|jwt|bearer|private_key|access_key|subscription-key"
+                 "|x-amz-signature|x-amz-security-token")
 # The name follows the start of the text, ? & ; # or an encoded ? or &. The
 # value ends at & # white space, a quote, or an encoded &.
 _TOKEN_RE = re.compile(r"(?i)((?:^|[?&;#]|%3F|%26)(?:" + _SECRET_NAMES
@@ -326,14 +328,21 @@ def redact(text: Any) -> Any:
 # JSON key names whose string value is a credential. "key" and "sig" are left
 # out: as JSON keys they hold ordinary data far more often than a secret.
 # A key is compared in lower case with "_" and "-" removed, so apiKey, api_key
-# and API-KEY are one name.
+# and API-KEY are one name. A name that ends in apikey (googleApiKey) or
+# mapskey (bingMapsKey) is a secret too, whatever precedes it.
 _SECRET_KEYS = frozenset((
     "token", "accesstoken", "oauthtoken", "refreshtoken", "idtoken", "apikey",
-    "ticket", "password", "passwd", "pwd", "clientsecret", "secret"))
+    "ticket", "password", "passwd", "pwd", "clientsecret", "secret", "signature",
+    "jwt", "bingkey", "googlekey", "accesskey", "privatekey", "secretkey",
+    "sharedkey", "subscriptionkey"))
+_SECRET_KEY_ENDS = ("apikey", "mapskey")
 
 
 def _is_secret_key(key: Any) -> bool:
-    return isinstance(key, str) and key.lower().replace("_", "").replace("-", "") in _SECRET_KEYS
+    if not isinstance(key, str):
+        return False
+    name = key.lower().replace("_", "").replace("-", "")
+    return name in _SECRET_KEYS or name.endswith(_SECRET_KEY_ENDS)
 
 
 def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
@@ -506,6 +515,19 @@ def iter_items(gis, item_types: list[str], extra_query: str = "",
                "a search returns only items the signed-in account can access")
         log.warning("enumerated %d of %s reported items. Some content was "
                     "not returned (%s)", stats["seen"], stats["reported"], why)
+
+
+def empty_types(requested: list[str], type_counts: dict, cut_short: bool) -> list[str]:
+    """The requested --types values that returned no item, when another one did.
+
+    One mistyped name beside a valid one returns items for the valid name only,
+    so the scan looks complete. The tool cannot tell a typo from a type the
+    organization has no item of, so it reports both. A scan that stopped short
+    is already reported as incomplete, and it names none here.
+    """
+    if cut_short or not type_counts:
+        return []
+    return [t for t in requested if not type_counts.get(t.lower())]
 
 
 def is_incomplete(stats: dict) -> bool:
@@ -1087,6 +1109,7 @@ class Scan:
     unread_items: list = field(default_factory=list)
     n: int = 0
     stats: dict = field(default_factory=dict)
+    type_counts: dict = field(default_factory=dict)  # lower-case item type -> items seen
 
 
 def short_names(names: list[str], limit: int = 5) -> str:
@@ -1121,6 +1144,8 @@ def scan_org(gis, args, old: str, new: str, opts: MatchOpts, apply: bool,
     updated_ids = out_dir / "updated_ids.txt"
     for item in iter_items(gis, scan_types, args.query, args.max_items, scan.stats):
         scan.n += 1
+        kind = (item.type or "").lower()
+        scan.type_counts[kind] = scan.type_counts.get(kind, 0) + 1
         if item.id in done:
             scan.counts["resumed"] += 1
             continue
@@ -1243,9 +1268,11 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
     # A search that matched nothing checked nothing. A mistyped --types or
     # --query gives the same silence as an org with no such item.
     nothing = scan.n == 0
+    missing = empty_types(types, scan.type_counts, incomplete)
     # --no-resources reads no resource of any item: a clean run proves less.
     status = exit_status(scan.counts.get("failed", 0),
-                         incomplete or nothing or args.no_resources, unread)
+                         incomplete or nothing or bool(missing) or args.no_resources,
+                         unread)
     if scan.counts.get("failed"):
         log.warning("%d items FAILED, see the report", scan.counts["failed"])
     if incomplete:
@@ -1258,6 +1285,11 @@ def run(args, org: str, user: str, pwd: str, old: str, new: str, apply: bool,
         log.warning("INCOMPLETE: the search returned no item, so nothing was "
                     "checked. Check the --types spelling, the --query clause and "
                     "the organization. Exit status %d.", EXIT_INCOMPLETE)
+    if missing:
+        log.warning("INCOMPLETE: --types %s returned no item, so nothing of that "
+                    "type was checked. Check the spelling, or take the name out "
+                    "of --types if the organization has none. Exit status %d.",
+                    ", ".join(missing), EXIT_INCOMPLETE)
     if args.no_resources:
         log.warning("INCOMPLETE: --no-resources read no resource of any item. "
                     "StoryMap and Experience Builder drafts may still hold the "
@@ -2066,6 +2098,10 @@ def _selftest_csv(h):
                  "ticket", "password", "passwd", "pwd", "secret", "client_secret", "sig"):
         check(redact("u?f=json&%s=SEC1&x=1" % name) == "u?f=json&%s=[redacted]&x=1" % name,
               "redact blanks %s=" % name + PIN)
+    for name in ("signature", "api-key", "jwt", "client-secret", "bearer", "private_key",
+                 "access_key", "subscription-key", "x-amz-signature", "x-amz-security-token"):
+        check(redact("u?f=json&%s=SEC1&x=1" % name) == "u?f=json&%s=[redacted]&x=1" % name,
+              "redact blanks %s=" % name + PIN)
     check(redact("u?token%3DSEC2%26f%3Djson") == "u?token%3D[redacted]%26f%3Djson"
           and redact("u%3Fkey%3DSEC2") == "u%3Fkey%3D[redacted]",
           "redact blanks an encoded token%3D and key%3D" + PIN)
@@ -2433,6 +2469,22 @@ def _scenario_enumeration(cli, h):
     check(typo.code == 3 and "scanned 0 items" in typo.out
           and "the search returned no item, so nothing was checked" in typo.out,
           "a search that returns no item exits 3, not a clean 0" + PIN)
+    cli.org.items["st"] = dict(_item("Story", {"keep": {"url": _OTHER}}), type="StoryMap")
+    pair = cli.run(cli.base(["--types", "Web Map,StoryMap"]))
+    check(pair.code == 0 and "scanned 6 items" in pair.out and "returned no item" not in pair.out,
+          "two types that both return items exit 0")
+    half = cli.run(cli.base(["--types", "Web Map,Story Map"]))
+    check(half.code == 3 and "scanned 5 items" in half.out
+          and "--types Story Map returned no item, so nothing of that type was checked" in half.out,
+          "a mistyped type beside a valid one exits 3, not a clean 0" + PIN)
+    cut = cli.run(cli.base(["--types", "Web Map,StoryMap", "--max-items", "2"]))
+    check(cut.code == 3 and "--max-items stopped the scan" in cut.out and "returned no item" not in cut.out,
+          "a scan cut short by --max-items says so and does not blame a type")
+    check(empty_types(["Web Map", "WEB MAP", "Typo"], {"web map": 2}, False) == ["Typo"]
+          and empty_types(["a"], {}, False) == [] and empty_types(["a"], {"b": 1}, True) == [],
+          "empty_types names each requested type with no item, compares in lower case, and"
+          " names none for an empty or a cut-short scan")
+    del cli.org.items["st"]
     cli.org.items["e0"]["data"] = None
     cli.org.items["e1"]["raw"] = "not json"
     both = cli.run(cli.base())
@@ -2962,6 +3014,13 @@ def _selftest_units(h, tmp):
                             "Password": "K4", "client_secret": "K5", "n": {"idToken": "K6"}})
     check(kn == 6 and not any(("K%d" % i) in json.dumps(keyed) for i in range(1, 7)),
           "apiKey, API-KEY, api_key, Password, client_secret and idToken are blanked, in lists too" + PIN)
+    named, nn = redact_doc({"bingKey": "B1", "googleApiKey": "G2", "bingMapsKey": "M3",
+                            "signature": "S4", "jwt": "J5", "mapboxApiKey": "X6"})
+    check(nn == 6 and not any(("%s%d" % (c, i)) in json.dumps(named)
+                              for c, i in (("B", 1), ("G", 2), ("M", 3), ("S", 4), ("J", 5), ("X", 6))),
+          "bingKey, googleApiKey, bingMapsKey, signature, jwt and mapboxApiKey are blanked" + PIN)
+    check(not _is_secret_key(5) and _is_secret_key("Google_Api-Key"),
+          "a key that is not text is no secret name, and the apikey ending ignores case, _ and -")
     plain_keys = {"key": "k", "sig": "s", "token": 5, "secret": "", "pwd": None, "authToken": "a"}
     check(redact_doc(plain_keys) == (plain_keys, 0),
           "key, sig, authToken, and a non-string or empty value under a secret name stay as they are")

@@ -22,7 +22,9 @@ still holds the old URL. The next time an author opens the draft, the old URL is
 This tool walks the whole JSON tree of each item and its JSON resources. It rewrites every string that
 starts with the old service URL, at a URL boundary. It also looks for the old URL inside longer text
 (pop-up HTML, story text, an encoded `url=` parameter) and reports each such item, because it does not
-rewrite those. It writes a report first, and it writes to the organization only when you pass `--apply`.
+rewrite those. A dry run writes a report and changes nothing in the organization. A run with `--apply` writes
+the report after the items are written, so a crash during `--apply` leaves written items and no report
+(see `updated_ids.txt`).
 
 ## What already exists
 
@@ -86,6 +88,7 @@ python agol_relink.py \
 # read changes.csv, then re-run with --apply. You will be asked to type APPLY.
 ```
 
+The organization URL comes from `--org`, whose default is the `AGOL_URL` environment variable.
 The user name comes from `--user`, from `AGOL_USER`, or from a prompt. The password comes from
 `AGOL_PASS` or from a prompt, and nowhere else: there is no `--password` flag and no password setting in the
 script. A password on the command line shows in the process list, in shell history and in a scheduled task's
@@ -120,8 +123,8 @@ A run without `--out-dir` writes a timestamped directory. With `--out-dir`, it w
 |---|---|
 | `changes.csv` | one row per URL: item, title, type, owner, status, JSON path, before, after, error. A skipped item, or a failed item that found no URL, gets one row with the three URL columns empty. A failed item that found a URL before it failed keeps one row per URL, status `failed`, with before and after filled in. The after value is what the rewrite would have been: do not read it as written. |
 | `run.log` | full log, including library chatter kept off your screen, and one `unread` line for every item with data or resources the tool did not read |
-| `backups/<itemid>.json` | the item's original data JSON, saved before any write, with each credential value blanked (see "Tokens in URLs") |
-| `backups/resources/<itemid>/` | original resource JSON, with each credential value blanked |
+| `backups/<itemid>.json` | the item's original data JSON, saved before any write, with the credential values the tool recognises blanked (see "Tokens in URLs" for the names and for what stays) |
+| `backups/resources/<itemid>/` | original resource JSON, with the credential values the tool recognises blanked |
 | `updated_ids.txt` | ids confirmed written. Feed the directory to `--resume` after a crash |
 
 A dry run writes `changes.csv`, `run.log` and an empty `backups` directory, all on your disk. The self-test
@@ -188,13 +191,17 @@ read a backup. A reused `--out-dir` keeps the mode of an old backup file, becaus
 not created again.
 
 The parameter names are `token`, `access_token`, `oauth_token`, `refresh_token`, `id_token`, `api_key`,
-`apikey`, `key`, `ticket`, `password`, `passwd`, `pwd`, `secret`, `client_secret` and `sig`, in any letter case.
+`apikey`, `key`, `ticket`, `password`, `passwd`, `pwd`, `secret`, `client_secret`, `sig`, `signature`, `api-key`,
+`jwt`, `client-secret`, `bearer`, `private_key`, `access_key`, `subscription-key`, `x-amz-signature` and
+`x-amz-security-token`, in any letter case.
 The whole name must match, so `authToken=` and `monkey=` stay. The name may follow `?`, `&`, `;`, `#` or an
 encoded `?` or `&`, and the equals sign may be `%3D`. The value of `user:password@host` in a URL is blanked too.
 A secret in free text that is not part of a query string is not blanked.
 A string value under a JSON key is blanked in the backups, such as `"customParameters": {"token": "..."}` or
 `"apiKey": "..."`. The key names are `token`, `access_token`, `oauth_token`, `refresh_token`, `id_token`,
-`apikey`, `ticket`, `password`, `passwd`, `pwd`, `secret` and `client_secret`, compared in any letter case with
+`apikey`, `ticket`, `password`, `passwd`, `pwd`, `secret`, `client_secret`, `signature`, `jwt`, `bingkey`,
+`googlekey`, `accesskey`, `privatekey`, `secretkey`, `sharedkey` and `subscriptionkey`, plus any name that ends in
+`apikey` or `mapskey` (`googleApiKey`, `bingMapsKey`). Names are compared in any letter case with
 `_` and `-` ignored, so `apiKey`, `api_key` and `API-KEY` are one name. `key` and `sig` are left out of this
 list, because as JSON keys they hold ordinary data far more often than a secret. A number, an empty string or
 a value that is not a string under one of these keys stays as it is. A rollback from a backup restores
@@ -323,7 +330,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - `changes.csv` is UTF-8 without a byte order mark, so Excel on Windows can show non-ASCII titles as garbled text. This is observed Excel behaviour, not something the self-test exercises. Open it with Data > From Text and choose UTF-8 as the file origin. Microsoft's [Text Import Wizard](https://support.microsoft.com/en-us/office/text-import-wizard-c5b02af6-fda1-4440-899f-f78bafe41857) page says only "Select the character set that's used in the text file" and names no UTF-8 value.
 - The tool strips no control character from a title, owner or URL. `changes.csv` gets only the leading-character apostrophe guard, and a title with a newline can forge a line in `run.log` and on the console.
 - On a Windows console that uses cp1252, a title with characters outside cp1252 makes the logger print a `--- Logging error ---` block and drop that one console line. The run still finishes. `run.log` and `changes.csv` are complete. Set `PYTHONUTF8=1` for non-Latin titles.
-- A search that returns zero items logs `scanned 0 items` and exits 3, because nothing was checked. A mistyped `--types` such as `Storymap` gives this. A typo beside a valid name, as in `Web Map,Storymap`, still scans the valid name and exits 0 on a clean result. Check the `--types` spelling in the `query:` line.
+- A search that returns zero items logs `scanned 0 items` and exits 3, because nothing was checked. A mistyped `--types` such as `Storymap` gives this. A typo beside a valid name, as in `Web Map,Storymap`, returns items for the valid name only. The run then logs `--types Storymap returned no item` and exits 3. The tool cannot tell a typo from a type the organization has no item of, so it reports both: take such a name out of `--types`. A scan cut short by `--max-items` reports the cut and names no type.
 - A `--resume` directory that does not exist, or has no `updated_ids.txt`, resumes nothing and says nothing. Re-processing an updated item finds no match, so no harm follows.
 - A dry run that reuses an `--out-dir` overwrites the earlier `changes.csv`, which may be the record of an applied run.
 - A lone surrogate character in item JSON makes the backup write fail and ends the run with exit 1. A lone surrogate in an item title, owner or URL ends the run with exit 1 as well, at the `changes.csv` write. The tool encodes the whole report before it opens the file, so no new `changes.csv` is written, and an old one in a reused `--out-dir` stays as it was. After `--apply` the writes are already made: read `updated_ids.txt`.
@@ -339,12 +346,19 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A UTF-8 byte order mark at the start of item data or of a `.json` resource makes the item fail with `is not JSON`. The failure is loud, not a clean result.
 - Under `--apply` on Windows, a resource name that holds a character the file system forbids, such as `*`, ends the run with exit 1 at the backup write, because the backup file name is built from the resource name. `safe_backup_name` rejects only a backslash, a colon, a leading slash and a `..` segment. An item id is used in a backup file name unchecked.
 - A resource name goes into the request path unquoted. A name with `#` or `?`, or with a `%` that forms an escape such as `%41`, reads another path, and the item fails with exit 2 or reads a different existing resource instead. A plain `%`, as in `a%b.json`, reads fine.
-- A credential parameter whose name is not in the listed names, such as `api-key`, `signature` or `jwt`, is written to every output file as the item holds it.
+- A credential parameter whose name is not in the listed names, such as `authToken=` or `sessionid=`, is written to every output file as the item holds it.
 - A value that starts with a listed name and an equals sign, such as a filter `TICKET=1234`, is blanked in the backup, and a rollback from it restores `[redacted]`.
 - Close any open `changes.csv` before a run that reuses `--out-dir`. The tool opens the report only after the items are written, so a file that Excel holds open ends an `--apply` run with exit 1 and no report. `updated_ids.txt` and the backups survive.
 - A value stored without a scheme, or as `//host/path`, is not matched, rewritten or reported.
 - A URL that writes the default port, such as `:443`, does not match the same URL without it. It is neither rewritten nor reported, and the run exits 0.
-- A credential parameter named `client-secret` is not blanked, like `api-key`. A JSON key outside the list, such as `bingKey`, and a header such as `Authorization: Bearer ...`, are written as the item holds them.
+- A JSON key outside the list, such as `authToken`, and a header such as `Authorization: Bearer ...`, are written as the item holds them.
+- A dictionary key that holds a token, such as `{"https://h/x/0?token=S": {}}`, is written to the backup as it is. Only values are blanked.
+- A credential in free text, such as a Notebook code cell or a note, is copied into the backup of an item that is changed.
+- The tool scans item data and JSON resources only. It does not scan an item's description, snippet or metadata XML, nor the own `url` of a non-service item such as a Web Mapping Application. Exit 0 does not mean no reference remains on the item page.
+- A `.json` resource that holds a bare JSON value (a string, number, `true` or `null`) instead of an object or array fails its item.
+- A resource name that contains `token=` but does not start it or follow `?`, `&`, `;` or `#`, such as `a_token=S.zip`, is printed unblanked in the console `unread` list and in `run.log`. Only whole parameter names are matched.
+- With no terminal attached, `getpass` falls back to an echoing read, so a password typed to a non-tty stdin can echo. Use `AGOL_PASS` for scheduled runs.
+- The tool sends the password only to the `arcgis` package. Which sign-in endpoint that package then uses is its own choice, and this README read it from the 2.4.2 source only, not from a live run.
 - A secret-named JSON key is blanked only when its value is a string. A dictionary under `token`, such as `{"token": {"value": "X"}}`, keeps its inner string in the backup.
 - In a `user:password@host` URL, a password that holds a literal `@` is blanked only up to the first `@`. Percent-encode the password in the URL.
 - A 200 answer with an empty body is read as `{}`, for item data and for a resource alike, so the item counts as clean with no data. A draft cut off in transit reads as clean.
@@ -391,7 +405,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 
 ## Testing
 
-`--self-test` runs 362 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 378 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -409,6 +423,8 @@ PASS  changes.csv title guards a leading '=' and nothing else  <-- pinned defect
 PASS  a dry run sends no write request to the org  <-- pinned defect
 ...
 PASS  a token in a matched url is blanked in changes.csv  <-- pinned defect
+...
+PASS  a mistyped type beside a valid one exits 3, not a clean 0  <-- pinned defect
 ...
 PASS  a dry run that finds an old url inside longer text exits 3, got 3  <-- pinned defect
 PASS  each item is listed with the path of the embedded url  <-- pinned defect
@@ -456,7 +472,7 @@ PASS  a raw read asks for the response, so the library saves no file to the temp
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-362 assertions, 0 failed
+378 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -469,7 +485,7 @@ The self-test covers:
   a failing resource listing, a listing that answers `200` with an error body, a resource that cannot be read or is not JSON, a `200` answer with an
   error body for item data or a resource, a search that keeps failing, and a retried `503` and `429`
 - that a resource write is a multipart file upload and never `text=`
-- the incomplete-scan exit, the unread-item exit, the exit for a search that returns nothing, a resource list of several pages, `--max-items` with and without items left over, and `--include-item-url`
+- the incomplete-scan exit, the unread-item exit, the exit for a search that returns nothing, the exit for one mistyped type beside a valid one, a resource list of several pages, `--max-items` with and without items left over, and `--include-item-url`
 - prompts, environment variables, the `CONFIGURATION` block, a wrong password, a missing `arcgis` package,
   and an `arcgis` import that fails on the ArcGIS Pro licence
 - a backup that holds a secret under a JSON key such as `apiKey`, a title that UTF-8 cannot encode, and the `note` line about private items of other members
@@ -484,18 +500,18 @@ Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 362 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 362 |
-| Windows | 3.9.25 | 362 |
-| Windows | 3.12 | 362 |
-| Linux | 3.12.3 | 362 |
+| Windows | 3.13.2 (`C:\Python313`) | 378 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 378 |
+| Windows | 3.9.25 | 378 |
+| Windows | 3.12 | 378 |
+| Linux | 3.12.3 | 378 |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`. The permission-mode
 assertions pass trivially on Windows, where they test nothing. They run for real on Linux.
 
 Branch coverage was measured with `coverage run --branch agol_relink.py --self-test` on Windows, with
 coverage.py 7.16.1 on a Python 3.13 virtual environment: 100% of
-1782 statements and 376 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
+1810 statements and 384 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
 guard, whose false side only happens on import. The self-test code is part of the measured file.
 
 ### What the self-test does not cover
@@ -514,8 +530,7 @@ These Limits sentences describe behaviour that the self-test never asserts. Each
 
 - a `:443` default-port mismatch
 - a byte order mark in item data
-- `api-key`, `signature`, `jwt` and `client-secret` staying unblanked
-- `bingKey` and `Authorization` headers staying as held
+- `authToken` and `Authorization` headers staying as held
 - `%41` in a resource name
 - `1e400` written as `Infinity`
 - a password that holds a literal `@`
