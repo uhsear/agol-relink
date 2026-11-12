@@ -378,6 +378,10 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A resource name with `..` segments makes a dry run read another path on the same portal, because the name is requested before `safe_backup_name` runs. No request goes to another host.
 - Ctrl-C is not caught. The run ends with a traceback and the interpreter's exit status, not a code from 0 to 3, and writes no `changes.csv`. Read `updated_ids.txt` for items already written.
 - A library error text that spells a credential as `token=abc` after a space, or as `'token': 'abc'`, reaches `changes.csv` and `run.log` as it is. Only a query string is blanked.
+- Under `--apply`, the tool writes a patched resource as plain JSON into a temporary folder before it uploads the file, and deletes the folder after the upload. That file can hold a token the resource holds, and a killed process can leave it behind.
+- A token in the free text of an item title, such as `x token=S` with a space before the name, is not blanked. It reaches `changes.csv`, `run.log` and the console as typed, because only query-string positions are matched.
+- The `changes.csv` guard checks the first character only, so a full-width `=`, `+`, `-` or `@` at the start of a cell is not guarded.
+- Running or importing the module from the repository directory writes a `__pycache__` folder there. `.gitignore` excludes it.
 - Exit 2 also comes from a usage error, in which case no output directory exists.
 - `run.log` says `No changes.csv was written` after any unexpected error. If the failure comes after the report is written, `changes.csv` is on disk. Treat that sentence as `changes.csv may be incomplete`.
 - A token nested more than 200 levels deep is written unblanked to a backup, and that item exits 0.
