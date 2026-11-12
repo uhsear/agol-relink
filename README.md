@@ -39,7 +39,8 @@ Esri ships two ways to do this. Use them when they fit.
   includes "Update the URLs of services in a web map". Its README says the application "has not been updated in many years".
 
 This tool adds a dry-run report for a whole organization, apps and dashboards as well as maps, the
-draft resources, and a backup of every item before it changes.
+draft resources, and a backup of each item's data and JSON resources before it changes. A service-item
+url rewrite (`--include-item-url`) has no backup file and is recorded only in `changes.csv`.
 
 On 2026-11-11, `gh search repos` for `agol-relink` returned this repository. The searches
 `arcgis relink`, `webmap url replace arcgis` and `arcgis item url find replace` returned nothing. A
@@ -319,7 +320,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - The walk stops at depth 200 with a log warning. The item still counts as clean or matched, and the run exits 0.
 - A mistyped flag such as `--pass SECRET` prints `error: unrecognized arguments: --pass [hidden]`. The tool hides the value of an unrecognised argument. It keeps the option name, so you see what you mistyped.
 - The apostrophe prefix stops a formula on first open. OWASP warns it is not reliable in Excel after the file is saved and re-opened.
-- `changes.csv` is UTF-8 without a byte order mark, so Excel on Windows can show non-ASCII titles as garbled text. Open it with Data > From Text and choose UTF-8.
+- `changes.csv` is UTF-8 without a byte order mark, so Excel on Windows can show non-ASCII titles as garbled text. This is observed Excel behaviour, not something the self-test exercises. Open it with Data > From Text and choose UTF-8 as the file origin. Microsoft's [Text Import Wizard](https://support.microsoft.com/en-us/office/text-import-wizard-c5b02af6-fda1-4440-899f-f78bafe41857) page says only "Select the character set that's used in the text file" and names no UTF-8 value.
 - The tool strips no control character from a title, owner or URL. `changes.csv` gets only the leading-character apostrophe guard, and a title with a newline can forge a line in `run.log` and on the console.
 - On a Windows console that uses cp1252, a title with characters outside cp1252 makes the logger print a `--- Logging error ---` block and drop that one console line. The run still finishes. `run.log` and `changes.csv` are complete. Set `PYTHONUTF8=1` for non-Latin titles.
 - A search that returns zero items logs `scanned 0 items` and exits 3, because nothing was checked. A mistyped `--types` such as `Storymap` gives this. A typo beside a valid name, as in `Web Map,Storymap`, still scans the valid name and exits 0 on a clean result. Check the `--types` spelling in the `query:` line.
@@ -346,11 +347,11 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A credential parameter named `client-secret` is not blanked, like `api-key`. A JSON key outside the list, such as `bingKey`, and a header such as `Authorization: Bearer ...`, are written as the item holds them.
 - A secret-named JSON key is blanked only when its value is a string. A dictionary under `token`, such as `{"token": {"value": "X"}}`, keeps its inner string in the backup.
 - In a `user:password@host` URL, a password that holds a literal `@` is blanked only up to the first `@`. Percent-encode the password in the URL.
-- A 200 answer with an empty body is read as `{}`, so the item counts as clean with no data.
+- A 200 answer with an empty body is read as `{}`, for item data and for a resource alike, so the item counts as clean with no data. A draft cut off in transit reads as clean.
 - A search answer whose `nextStart` is a string raises a `TypeError` in the item walk and ends the run with exit 1. Esri always sends an integer.
-- Python 3.9 prints `ResourceWarning` lines for unclosed files when the self-test runs with `-W error`. The module itself compiles clean under `-W error`.
+- Python prints `ResourceWarning` lines when the self-test runs with `-W error`. Python 3.9, 3.12 and 3.13 print the same five lines. The module itself compiles clean under `-W error`.
 - The tool writes `changes.csv` and `run.log` with the default file mode. Only the backups use mode 0600. These two files hold titles, owners and redacted URLs, so set a restrictive `umask` on a shared Linux host.
-- The self-test excerpt in "Testing" shows lines from a real run in an order that differs from the run in three places.
+- The self-test excerpt in "Testing" shows lines from a real run in an order that differs from the run: a few lines are moved.
 - The tool does not check that an item is unchanged between the read and the `--apply` write, so an edit made by its owner in that window is overwritten with the older data.
 - The tool writes the whole item JSON again. Number formatting and duplicate keys of the original can change, and a number such as `1e400` is written as `Infinity`.
 - An invalid value for a known flag is printed by `argparse`: `--max-items hunter2` prints `invalid int value: 'hunter2'`. Only the `unrecognized arguments` error hides values.
@@ -358,6 +359,14 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A JSON tree that nests deeper than 200 levels is not scanned below that depth, and a token below that depth is not blanked in a backup. The item is reported clean with exit 0.
 - `--yes=hunter2` makes `argparse` print `ignored explicit argument 'hunter2'`: only the `unrecognized arguments` error hides values. A stray argument that begins with `--` is printed as typed, so a secret that begins with `--` would show.
 - The password prompt runs before the URL and `--types` checks, so a bad flag value is reported after you type the password.
+- The refusal message for a scheme-only move says a second run would apply the change twice. That is wrong for this case, because the rewrite is idempotent. The refusal itself is correct.
+- Item data is posted with the `text=` parameter by the `arcgis` package (`Item.update(data=...)`). Only resources are uploaded as a file. The sanitizing seen on `text=` resource writes was not checked for item data, so test a disposable web map with `style=` attributes in a pop-up before a large `--apply`.
+- A resource name with `..` segments makes a dry run read another path on the same portal, because the name is requested before `safe_backup_name` runs. No request goes to another host.
+- Ctrl-C is not caught. The run ends with a traceback and the interpreter's exit status, not a code from 0 to 3, and writes no `changes.csv`. Read `updated_ids.txt` for items already written.
+- A library error text that spells a credential as `token=abc` after a space, or as `'token': 'abc'`, reaches `changes.csv` and `run.log` as it is. Only a query string is blanked.
+- Exit 2 also comes from a usage error, in which case no output directory exists.
+- `run.log` says `No changes.csv was written` after any unexpected error. If the failure comes after the report is written, `changes.csv` is on disk. Treat that sentence as `changes.csv may be incomplete`.
+- A token nested more than 200 levels deep is written unblanked to a backup, and that item exits 0.
 - Exit 1 covers both a refusal (no `APPLY` typed, bad URLs) and an unexpected error that may follow writes. A wrapper script cannot tell them apart without `run.log`.
 - A resource listing entry whose `resource` value is not a string ends the run with exit 1 and writes no `changes.csv`. An entry with no `resource` key is skipped and not listed as unread. Esri always sends a string.
 - A move that changes only the scheme, such as `http://` to `https://` on the same path, is refused as nested under the old URL, because the match ignores the scheme by default. Nothing is written. Set `ANY_SCHEME` to `False` in the `CONFIGURATION` block to allow it. The `--strict-scheme` flag does not lift the refusal.
@@ -500,6 +509,16 @@ guard, whose false side only happens on import. The self-test code is part of th
 - **TLS.** The stub is plain HTTP on the loopback interface.
 - **How a spreadsheet opens the file.** The tests check the bytes in `changes.csv`. They do not open it in Excel.
 - **A scheduled task.** See the install note.
+
+These Limits sentences describe behaviour that the self-test never asserts. Each was checked by hand against this code:
+
+- a `:443` default-port mismatch
+- a byte order mark in item data
+- `api-key`, `signature`, `jwt` and `client-secret` staying unblanked
+- `bingKey` and `Authorization` headers staying as held
+- `%41` in a resource name
+- `1e400` written as `Infinity`
+- a password that holds a literal `@`
 
 ## Contributing
 
