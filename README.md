@@ -95,8 +95,8 @@ script. A password on the command line shows in the process list, in shell histo
 definition. `--password hunter2` exits 2 with `unrecognized arguments: --password [hidden]`.
 A wrong password prints one message that names the organization and the user. It never prints the password.
 
-A `CONFIGURATION` block at the top of the script holds every setting: URLs, organization, item types,
-matching strictness, retries. Fill it in and run with no arguments, or ignore it and use flags.
+A `CONFIGURATION` block at the top of the script holds the URL, organization, scope, matching, resource
+and retry settings. `--resume`, `--out-dir` and `-v` are flags only. Fill the block in and run with no arguments, or ignore it and use flags.
 Flags beat environment variables, which beat the block. `--dry-run` beats `APPLY = True` in the block.
 
 | Flag | Effect |
@@ -134,7 +134,7 @@ shows that a dry run sends no write request to the organization.
 
 | Code | Meaning |
 |---|---|
-| 0 | the search returned at least one item and every item the server reported, no item failed, and every item's data and resources were read |
+| 0 | the search returned at least one item and every item the server reported, no item failed, and the data and resources of every item the run examined were read. A service item has only its `url` checked, and a resumed item is not read again. |
 | 1 | refused or aborted: bad URLs, no `APPLY` typed, sign-in failed, `arcgis` missing or broken, or an unexpected error ended the run. After an unexpected error, items may already be written: read `updated_ids.txt`. |
 | 2 | at least one item failed. This code also means a command-line usage error. |
 | 3 | the scan was incomplete: the server reported more items than it returned, `--max-items` stopped the scan before the last item, the search returned no item at all, an item carries data or a resource this tool did not read, an item holds the old URL inside longer text, or `--no-resources` was set |
@@ -148,6 +148,8 @@ each. `run.log` has an `unread` line for every one of them, with all the names. 
 search printed a warning and exited 0, and an unchanged item with a binary resource was not mentioned.
 An organization with `.xlsx` or `.zip` resources on its StoryMaps will see exit 3 on every run.
 That is the intended signal: the tool cannot read those files.
+
+A run that checks service items, or that resumes, ends with a `note` line that says so.
 
 An item that holds the old URL inside longer text is listed the same way, with the JSON path of the first
 such string: `data: old URL inside longer text at .popupInfo.description`. The status of the item stays
@@ -317,6 +319,13 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 
 **Smaller limits.**
 
+- With `--include-item-url`, a service item gets only its registered `url` checked. Its item data and resources are not read, so an old URL held there is not found, and the run can exit 0.
+- A `--resume` run does not read again the items in `updated_ids.txt`. An unread resource or an embedded URL that the first run reported for one of them is not reported again, and the resumed run can exit 0.
+- An item that is only unread (the old URL inside longer text, or a non-JSON resource) gets no row in `changes.csv`. The run exits 3 and the item appears on the console and in `run.log`, so read `run.log`, not only the report.
+- Under `-v`, the library's own log lines are blanked by the query-string pattern only. A library version that logs `'password': '...'` would pass the filter unblanked.
+- A `{"name": "token", "value": "S"}` pair inside an array, such as a `customParameters` list, is copied into a backup unblanked. Only a string under a secret-named JSON key is blanked.
+- The apostrophe guard stops a formula on first open only. OWASP says the technique is not reliable in Excel after the file is saved and re-opened.
+- The self-test pins that a leading vertical tab, a full-width `=` and a full-width `+` stay unguarded. The Limits above are the reason.
 - A resource that cannot be read, or that is not JSON, fails its item. It is never skipped. The item is not clean until you read the resource by hand.
 - If a second resource write fails, the first is already changed. The item is reported `failed` and `/data` is not written.
 - A crash writes no `changes.csv`. Use `updated_ids.txt` and `--resume`.
@@ -409,7 +418,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 
 ## Testing
 
-`--self-test` runs 378 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 381 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -452,8 +461,10 @@ PASS  --max-items that leaves items unexamined exits 3 and says so, not exit 0  
 PASS  a search that returns no item exits 3, not a clean 0  <-- pinned defect
 ...
 PASS  naming a service type without the flag is refused before any request  <-- pinned defect
+PASS  a run that checks service items says their data and resources were not read  <-- pinned defect
 ...
 PASS  run.log names every unread item, the 16th included, with its resource  <-- pinned defect
+PASS  a resumed run says exit 0 does not cover what the first run left unread  <-- pinned defect
 ...
 PASS  --no-resources skips the resources: 38 urls, and the run exits 3, not 0  <-- pinned defect
 ...
@@ -476,7 +487,7 @@ PASS  a raw read asks for the response, so the library saves no file to the temp
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-378 assertions, 0 failed
+381 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -504,11 +515,11 @@ Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 378 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 378 |
-| Windows | 3.9.25 | 378 |
-| Windows | 3.12 | 378 |
-| Linux | 3.12.3 | 378 |
+| Windows | 3.13.2 (`C:\Python313`) | 381 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 381 |
+| Windows | 3.9.25 | 381 |
+| Windows | 3.12 | 381 |
+| Linux | 3.12.3 | 381 |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`. The permission-mode
 assertions pass trivially on Windows, where they test nothing. They run for real on Linux.

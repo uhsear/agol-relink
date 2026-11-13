@@ -1204,6 +1204,15 @@ def log_summary(scan: Scan, csv_path: Path, apply: bool) -> None:
     log.info("note   : a search returns only items the signed-in account can "
              "access. Private items of other members are not scanned and are "
              "not in the count above, so exit 0 does not cover them.")
+    svc = sum(n for k, n in scan.type_counts.items()
+              if k in [t.lower() for t in SERVICE_ITEM_TYPES])
+    if svc:
+        log.info("note   : %d service item(s) had only their url checked. Their "
+                 "data and resources were not read.", svc)
+    if scan.counts.get("resumed"):
+        log.info("note   : %d resumed item(s) were not read again. Exit 0 does "
+                 "not cover what the first run left unread in them.",
+                 scan.counts["resumed"])
     if scan.unread_items:
         log.warning("")
         log.warning("%d item(s) carry data or resources this tool did not read, "
@@ -2054,6 +2063,8 @@ def _selftest_csv(h):
           "cell leaves ordinary text, empty text and a leading space alone")
     check(cell("a=b") == "a=b" and cell("x\t=1") == "x\t=1",
           "cell guards only the first character")
+    check(cell("\x0b=1") == "\x0b=1" and cell("\uff1d1") == "\uff1d1" and cell("\uff0b1") == "\uff0b1",
+          "cell leaves a vertical tab and a full-width = or + alone, as the README says")
     check(cell("'=1") == "'=1", "cell does not double an apostrophe the text already starts with")
     check(cell(None) == "" and cell(5) == 5 and cell(-5) == -5 and cell(0.5) == 0.5,
           "numbers stay numbers and None becomes empty")
@@ -2261,6 +2272,8 @@ def _scenario_apply(cli, h):
     resumed = cli.run(cli.base(["--apply", "--yes", "--resume", out_dir]))
     check("resumed  2" in resumed.out and resumed.code == 0,
           "--resume skips the items the first run wrote")
+    check("2 resumed item(s) were not read again" in resumed.out,
+          "a resumed run says exit 0 does not cover what the first run left unread" + PIN)
     empty = os.path.join(cli.workdir, "empty_resume")
     os.makedirs(empty)
     with open(os.path.join(empty, "changes.csv"), "w", encoding="utf-8") as fh:
@@ -2518,6 +2531,8 @@ def _scenario_item_url(cli, h):
           sorted(row[0] for row in rows[1:]) == ["svc1", "svc3", "svc4", "w1"],
           "a dry run with --include-item-url lists the matching service items and writes nothing")
     check(any(row[5] == "item.url" and row[6] == _OLD for row in rows), "the item.url hit is named")
+    check("note   : 4 service item(s) had only their url checked" in dry.out,
+          "a run that checks service items says their data and resources were not read" + PIN)
     applied = cli.run(cli.base(["--include-item-url", "--apply", "--yes"]))
     check(cli.org.items["svc1"]["url"] == _NEW, "apply rewrites the registered url of a service item")
     check(cli.org.items["svc2"]["url"] == _OTHER, "a service item that does not match is untouched")
