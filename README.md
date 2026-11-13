@@ -13,7 +13,7 @@ map that used it opens with an empty layer. The map shows no error, because the 
 URL that no longer answers. The fix is a find-and-replace, but the URL is not where you expect.
 It sits in `operationalLayers`, and also in a group layer inside a group layer, in a basemap
 `styleUrl`, in a presentation slide, in a symbol image path, and under machine-made keys like
-`dataSources.dataSource_10.childDataSourceJsons.19465fe6e78-layer-61.url`.
+`dataSources.dataSource_10.childDataSourceJsons.layer-a1b2c3-7.url`.
 
 You patch the maps you can see. The StoryMap and Experience Builder items look fixed, because their
 published copy is fixed. Their working draft is a separate file in the item's resources, and it
@@ -261,7 +261,7 @@ and `.../Roads/MapServer/2/images/abc`. It never matches `.../Roads_Old/MapServe
 
 A fixed list of JSON paths would miss the machine-made keys. The self-test fixture covers a group layer
 nested two deep, `baseMap.baseMapLayers[].styleUrl`, a presentation slide basemap, a `tables` entry,
-and an unknown future key. An early scan of one real organization of a few hundred web maps found URLs at 13 distinct
+and an unknown future key. An early scan of one real organization found URLs at about a dozen distinct
 paths, which is why the walk does not use a list. That scan was not repeated for this version.
 
 The draft problem is where the walk matters most. StoryMaps keep the working draft in a resource named
@@ -323,7 +323,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A `--resume` run does not read again the items in `updated_ids.txt`. An unread resource or an embedded URL that the first run reported for one of them is not reported again, and the resumed run can exit 0.
 - An item that is only unread (the old URL inside longer text, or a non-JSON resource) gets no row in `changes.csv`. The run exits 3 and the item appears on the console and in `run.log`, so read `run.log`, not only the report.
 - Under `-v`, the library's own log lines are blanked by the query-string pattern only. A library version that logs `'password': '...'` would pass the filter unblanked.
-- A `{"name": "token", "value": "S"}` pair inside an array, such as a `customParameters` list, is copied into a backup unblanked. Only a string under a secret-named JSON key is blanked.
+- A `{"name": "token", "value": "S"}` pair, such as one in a `customParameters` list, has its `value` blanked when `name` or `key` is a secret name. A secret that sits in any other pairing of keys is not found.
 - The apostrophe guard stops a formula on first open only. OWASP says the technique is not reliable in Excel after the file is saved and re-opened.
 - The self-test pins that a leading vertical tab, a full-width `=` and a full-width `+` stay unguarded. The Limits above are the reason.
 - A resource that cannot be read, or that is not JSON, fails its item. It is never skipped. The item is not clean until you read the resource by hand.
@@ -361,14 +361,22 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A value stored without a scheme, or as `//host/path`, is not matched, rewritten or reported.
 - A URL that writes the default port, such as `:443`, does not match the same URL without it. It is neither rewritten nor reported, and the run exits 0.
 - A JSON key outside the list, such as `authToken`, and a header such as `Authorization: Bearer ...`, are written as the item holds them.
-- A dictionary key that holds a token, such as `{"https://h/x/0?token=S": {}}`, is written to the backup as it is. Only values are blanked.
+- A dictionary key that holds a token, such as `{"https://h/x/0?token=S": {}}`, is blanked in the backup like a value. Two keys that differ only in the token then collapse into one key.
 - A credential in free text, such as a Notebook code cell or a note, is copied into the backup of an item that is changed.
 - The tool scans item data and JSON resources only. It does not scan an item's description, snippet or metadata XML, nor the own `url` of a non-service item such as a Web Mapping Application. Exit 0 does not mean no reference remains on the item page.
 - A `.json` resource that holds a bare JSON value (a string, number, `true` or `null`) instead of an object or array fails its item.
 - A resource name that contains `token=` but does not start it or follow `?`, `&`, `;` or `#`, such as `a_token=S.zip`, is printed unblanked in the console `unread` list and in `run.log`. Only whole parameter names are matched.
+- `run.log` is appended to, not replaced, when `--out-dir` is reused. Use a fresh directory for each run.
+- Console redaction relies on the file handler's filter running first on the same log record.
+- A wrapper cannot tell a finding from an incomplete scan, or URLs found from nothing found, by exit code alone. Exit 3 covers both "the scan could not tell" and the old URL inside longer text, and a dry run that finds URLs to rewrite exits 0 like a clean run. Read `changes.csv` and `run.log`.
+- A run with no `--user` and no stdin ends in an `EOFError` traceback, though it exits 1. Supply `--user` (or `AGOL_USER`) and `AGOL_PASS` in a scheduled task.
+- Under `--apply`, the `arcgis` 2.4.2 `Item.update(data=...)` reads the item's thumbnail first when the item has one. That is one extra read request to the portal per updated item, not to a URL taken from item data.
+- The 0600 mode assertion passes trivially on Windows, so the Windows count does not prove the mode.
+- Dated search results change over time and show only what the search found on that day.
+- A live organization may answer differently from the stub.
 - With no terminal attached, `getpass` falls back to an echoing read, so a password typed to a non-tty stdin can echo. Use `AGOL_PASS` for scheduled runs.
 - The tool sends the password only to the `arcgis` package. Which sign-in endpoint that package then uses is its own choice, and this README read it from the 2.4.2 source only, not from a live run.
-- A secret-named JSON key is blanked only when its value is a string. A dictionary under `token`, such as `{"token": {"value": "X"}}`, keeps its inner string in the backup.
+- A secret-named JSON key (or a secret `name` beside a `value`) is blanked only when its value is a string. A dictionary under `token`, such as `{"token": {"value": "X"}}`, keeps its inner string in the backup.
 - In a `user:password@host` URL, a password that holds a literal `@` is blanked only up to the first `@`. Percent-encode the password in the URL.
 - A 200 answer with an empty body is read as `{}`, for item data and for a resource alike, so the item counts as clean with no data. A draft cut off in transit reads as clean.
 - A search answer whose `nextStart` is a string raises a `TypeError` in the item walk and ends the run with exit 1. Esri always sends an integer.
@@ -418,7 +426,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 
 ## Testing
 
-`--self-test` runs 381 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 385 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -476,6 +484,9 @@ PASS  a key=, apikey=, ticket= or fragment credential reaches no output file or 
 ...
 PASS  a backup holds the original data with the token value blanked  <-- pinned defect
 ...
+PASS  a name/value pair whose name is a secret name is blanked, other pairs stay  <-- pinned defect
+PASS  a dictionary key that holds a token is blanked and counted, a non-text key stays  <-- pinned defect
+...
 PASS  a secret held under a JSON key name is blanked, free text beside it is not  <-- pinned defect
 ...
 PASS  a backup holds no secret that sat under a JSON key name  <-- pinned defect
@@ -487,7 +498,7 @@ PASS  a raw read asks for the response, so the library saves no file to the temp
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-381 assertions, 0 failed
+385 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -515,18 +526,18 @@ Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 381 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 381 |
-| Windows | 3.9.25 | 381 |
-| Windows | 3.12 | 381 |
-| Linux | 3.12.3 | 381 |
+| Windows | 3.13.2 (`C:\Python313`) | 385 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 385 |
+| Windows | 3.9.25 | 385 |
+| Windows | 3.12 | 385 |
+| Linux | 3.12.3 | 385 |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`. The permission-mode
 assertions pass trivially on Windows, where they test nothing. They run for real on Linux.
 
 Branch coverage was measured with `coverage run --branch agol_relink.py --self-test` on Windows, with
 coverage.py 7.16.1 on a Python 3.13 virtual environment: 100% of
-1810 statements and 384 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
+1830 statements and 388 branches. One line carries `# pragma: no branch`: the `if __name__ == "__main__"`
 guard, whose false side only happens on import. The self-test code is part of the measured file.
 
 ### What the self-test does not cover

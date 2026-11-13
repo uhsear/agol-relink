@@ -348,8 +348,9 @@ def _is_secret_key(key: Any) -> bool:
 def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
     """A copy of a JSON document with every credential value blanked, and the count.
 
-    A string under a key named in _SECRET_KEYS is blanked whole. Every other
-    string is blanked by redact(). It works on the parsed strings, not on the dumped text, so a token inside
+    A string under a key named in _SECRET_KEYS is blanked whole, and so is the
+    "value" of a dict whose "name" or "key" is such a name. A dict key is blanked
+    by redact() like every other string. Every other string is blanked by redact(). It works on the parsed strings, not on the dumped text, so a token inside
     a string that holds more JSON cannot swallow the escaping quote. Past
     MAX_DEPTH the subtree is copied as it is, the same limit walk_replace has.
     """
@@ -360,11 +361,15 @@ def redact_doc(node: Any, depth: int = 0) -> tuple[Any, int]:
     total = 0
     if isinstance(node, dict):
         out_map: dict = {}
+        # {"name": "token", "value": "S"}: the name sits beside the value it guards
+        pair = any(_is_secret_key(node.get(label)) for label in ("name", "key"))
         for k, v in node.items():
-            if _is_secret_key(k) and isinstance(v, str) and v:
-                out_map[k], n = "[redacted]", 1
+            safe_key = redact(k)
+            total += count_secrets(k) if isinstance(k, str) else 0
+            if (_is_secret_key(k) or (pair and k == "value")) and isinstance(v, str) and v:
+                out_map[safe_key], n = "[redacted]", 1
             else:
-                out_map[k], n = redact_doc(v, depth + 1)
+                out_map[safe_key], n = redact_doc(v, depth + 1)
             total += n
         return out_map, total
     out_list: list = []
@@ -3039,6 +3044,24 @@ def _selftest_units(h, tmp):
     plain_keys = {"key": "k", "sig": "s", "token": 5, "secret": "", "pwd": None, "authToken": "a"}
     check(redact_doc(plain_keys) == (plain_keys, 0),
           "key, sig, authToken, and a non-string or empty value under a secret name stay as they are")
+    pairs, pn = redact_doc({"customParameters": [{"name": "token", "value": "NV1"},
+                                                 {"key": "Api_Key", "value": "NV2"},
+                                                 {"name": "f", "value": "json"}],
+                            "name": "password", "value": "NV3"})
+    check(pn == 3 and "NV" not in json.dumps(pairs) and pairs["customParameters"][2] == {"name": "f", "value": "json"},
+          "a name/value pair whose name is a secret name is blanked, other pairs stay" + PIN)
+    check(redact_doc({"name": "token", "value": 5, "x": "v"}) == ({"name": "token", "value": 5, "x": "v"}, 0)
+          and redact_doc({"name": "token", "value": ""}) == ({"name": "token", "value": ""}, 0),
+          "a non-string or empty value beside a secret name stays as it is")
+    keyed_url, ku = redact_doc({"https://h/x/0?token=NK1": {"a": "https://h/y?key=NK2"}, 7: "plain"})
+    check(ku == 2 and "NK" not in json.dumps(keyed_url) and keyed_url["https://h/x/0?token=[redacted]"]
+          == {"a": "https://h/y?key=[redacted]"} and keyed_url[7] == "plain",
+          "a dictionary key that holds a token is blanked and counted, a non-text key stays" + PIN)
+    pair_bak = Path(tmp) / "pair_bak.json"
+    write_backup(pair_bak, "pk1", {"p": [{"name": "token", "value": "NV4"}], "https://h/x/0?token=NK3": 1})
+    pair_text = pair_bak.read_text(encoding="utf-8")
+    check("NV4" not in pair_text and "NK3" not in pair_text and pair_text.count("[redacted]") == 2,
+          "a backup holds neither a name/value token nor a token in a dictionary key" + PIN)
     sec_bak = Path(tmp) / "secret_bak.json"
     write_backup(sec_bak, "sk1", {"config": {"apiKey": "AAPK-R1", "customParameters": {"token": "SEC-R2"}}})
     sec_text = sec_bak.read_text(encoding="utf-8")
