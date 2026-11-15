@@ -420,8 +420,9 @@ def cell(value: Any) -> Any:
 
 
 def out_cell(value: Any) -> Any:
-    """redact, then guard. Every text cell of changes.csv goes through this."""
-    return cell(scrub_text(redact(value), keep="\t\r\n"))
+    """scrub, redact, then guard. Every text cell of changes.csv goes through
+    this. Scrub first, so a zero-width character cannot split a token name."""
+    return cell(redact(scrub_text(value, keep="\t\r\n")))
 
 
 # --------------------------------------------------------------------------
@@ -957,11 +958,24 @@ def breadth_warning(old: str) -> str:
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def _scrub_arg(value):
+    """A log argument with every control character, newline included, blanked."""
+    if isinstance(value, (int, float)):
+        return value
+    return scrub_text(str(value))
+
+
 class _RedactFilter(logging.Filter):
     """Blank token= values in every record, whichever library wrote it."""
 
     def filter(self, record):
-        # Format first: an exception object in args is only str()-ed here.
+        # Each arg is portal text: a newline in it would forge a log line, so
+        # it is scrubbed alone, newline included. Only our own format string
+        # keeps its newlines. An exception object in args is str()-ed here.
+        if isinstance(record.args, dict):
+            record.args = dict((k, _scrub_arg(v)) for k, v in record.args.items())
+        elif record.args:
+            record.args = tuple(_scrub_arg(a) for a in record.args)
         record.msg = redact(scrub_text(record.getMessage(), keep="\n"))
         record.args = None
         if record.exc_info:
@@ -3157,6 +3171,13 @@ def _selftest_units(h, tmp):
     check(rec.getMessage() == "aborted: ValueError: ok [2K FAKE"
           and rec2.getMessage() == "pre ok [2K FAKE",
           "the log filter scrubs an exception object in args and a pre-formatted msg" + PIN)
+    rec = logging.LogRecord("x", logging.WARNING, "f", 1, "[%d] failed %s",
+                            (1, "ok\nINFO    FAKE line"), None)
+    _RedactFilter().filter(rec)
+    check(rec.getMessage() == "[1] failed ok INFO    FAKE line"
+          and out_cell("?tok\u200ben=SEC13") == "?token=[redacted]",
+          "a newline in a portal value cannot forge a log line, and a zero-width "
+          "character cannot split a token name past the redaction" + PIN)
     fake_gis = types.ModuleType("arcgis.gis")
 
     def _failing_gis(*_args):
