@@ -337,7 +337,8 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A mistyped flag such as `--pass SECRET` prints `error: unrecognized arguments: --pass [hidden]`. The tool hides the value of an unrecognised argument. It keeps the option name, so you see what you mistyped.
 - The apostrophe prefix stops a formula on first open. OWASP warns it is not reliable in Excel after the file is saved and re-opened.
 - `changes.csv` is UTF-8 without a byte order mark, so Excel on Windows can show non-ASCII titles as garbled text. This is observed Excel behaviour, not something the self-test exercises. Open it with Data > From Text and choose UTF-8 as the file origin. Microsoft's [Text Import Wizard](https://support.microsoft.com/en-us/office/text-import-wizard-c5b02af6-fda1-4440-899f-f78bafe41857) page says only "Select the character set that's used in the text file" and names no UTF-8 value.
-- The tool strips no control character from a title, owner or URL. `changes.csv` gets only the leading-character apostrophe guard, and a title with a newline can forge a line in `run.log` and on the console.
+- The tool replaces a control character in a title, owner or URL with a space, and drops zero-width and bidi characters, in the console, `run.log` and `changes.csv`. `changes.csv` keeps tab, carriage return and newline, which its CSV quoting holds inside one cell. Other Unicode tricks, such as look-alike letters, are not touched.
+- The stub in the self-test sends the sign-in token in the `X-Esri-Authorization: Bearer` header and never in the query string, and the self-test pins that no request line holds `token=`. The tool itself leaves token handling to the `arcgis` library. A header token needs ArcGIS Server 10.5.1 or later; an older server only accepts the token in the query string.
 - On a Windows console that uses cp1252, a title with characters outside cp1252 makes the logger print a `--- Logging error ---` block and drop that one console line. The run still finishes. `run.log` and `changes.csv` are complete. Set `PYTHONUTF8=1` for non-Latin titles.
 - A search that returns zero items logs `scanned 0 items` and exits 3, because nothing was checked. A mistyped `--types` such as `Storymap` gives this. A typo beside a valid name, as in `Web Map,Storymap`, returns items for the valid name only. The run then logs `--types Storymap returned no item` and exits 3. The tool cannot tell a typo from a type the organization has no item of, so it reports both: take such a name out of `--types`. A scan cut short by `--max-items` reports the cut and names no type.
 - A `--resume` directory that does not exist, or has no `updated_ids.txt`, resumes nothing and says nothing. Re-processing an updated item finds no match, so no harm follows.
@@ -426,7 +427,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 
 ## Testing
 
-`--self-test` runs 385 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 389 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -498,7 +499,7 @@ PASS  a raw read asks for the response, so the library saves no file to the temp
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-385 assertions, 0 failed
+389 assertions, 0 failed
 ```
 
 The self-test covers:
@@ -526,11 +527,11 @@ Results on this version:
 
 | Host | Python | Assertions |
 |---|---|---|
-| Windows | 3.13.2 (`C:\Python313`) | 385 |
-| Windows | 3.13.7 (ArcGIS Pro conda clone) | 385 |
-| Windows | 3.9.25 | 385 |
-| Windows | 3.12 | 385 |
-| Linux | 3.12.3 | 385 |
+| Windows | 3.13.2 (`C:\Python313`) | 389 |
+| Windows | 3.13.7 (ArcGIS Pro conda clone) | 385 (not re-run for this version) |
+| Windows | 3.9.25 | 389 |
+| Windows | 3.12 | 389 |
+| Linux | 3.12.3 | 385 (not re-run for this version) |
 
 The counts are equal because the self-test does not use `arcpy` or `arcgis`. The permission-mode
 assertions pass trivially on Windows, where they test nothing. They run for real on Linux.

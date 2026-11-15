@@ -325,6 +325,22 @@ def redact(text: Any) -> Any:
     return _USERINFO_RE.sub(r"\1[redacted]", _TOKEN_RE.sub(r"\1[redacted]", text))
 
 
+# Terminal and display controls: C0, DEL, C1, line and paragraph separators,
+# zero-width characters, bidi embeddings, overrides and isolates.
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_INVISIBLE_RE = re.compile("[\u200b-\u200d\ufeff\u202a-\u202e\u2066-\u2069]")
+
+
+def scrub_text(text: Any, keep: str = "") -> Any:
+    """Make portal text safe to print: a control character becomes a space and
+    a zero-width or bidi character is dropped, so an item title cannot redraw
+    or forge a report line. keep lists control characters to leave alone."""
+    if not isinstance(text, str):
+        return text
+    text = _CONTROL_RE.sub(lambda m: m.group() if m.group() in keep else " ", text)
+    return _INVISIBLE_RE.sub("", text)
+
+
 # JSON key names whose string value is a credential. "key" and "sig" are left
 # out: as JSON keys they hold ordinary data far more often than a secret.
 # A key is compared in lower case with "_" and "-" removed, so apiKey, api_key
@@ -405,7 +421,7 @@ def cell(value: Any) -> Any:
 
 def out_cell(value: Any) -> Any:
     """redact, then guard. Every text cell of changes.csv goes through this."""
-    return cell(redact(value))
+    return cell(scrub_text(redact(value), keep="\t\r\n"))
 
 
 # --------------------------------------------------------------------------
@@ -945,12 +961,17 @@ class _RedactFilter(logging.Filter):
     """Blank token= values in every record, whichever library wrote it."""
 
     def filter(self, record):
+        if isinstance(record.args, tuple):
+            record.args = tuple(scrub_text(a) for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: scrub_text(v) for k, v in record.args.items()}
         record.msg = redact(record.getMessage())
         record.args = None
         if record.exc_info:
             # A traceback is formatted after the filters run, from exc_info.
             # Format it here, blank the tokens, and drop exc_info.
-            record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_text = scrub_text(
+                redact(logging.Formatter().formatException(record.exc_info)), keep="\n")
             record.exc_info = None
         return True
 
@@ -1096,7 +1117,7 @@ def connect(org: str, user: str, pwd: str):
 
 def confirm_apply(old: str, new: str) -> bool:
     print("\n*** --apply will MODIFY items in this organization. ***")
-    print("    %s\n -> %s\n" % (redact(old), redact(new)))
+    print("    %s\n -> %s\n" % (scrub_text(redact(old)), scrub_text(redact(new))))
     return input("Type APPLY to continue: ").strip() == "APPLY"
 
 
@@ -1380,6 +1401,7 @@ class _StubOrg(object):
     def __init__(self, items=None):
         self.items = items or {}
         self.requests = []
+        self.request_lines = []   # the raw request line of every request, as a proxy log would hold it
         self.faults = {}          # path fragment -> [(http status, payload)]
         self.total_override = None
         self.page_cap = 0
@@ -1510,13 +1532,14 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
                 params.update(urllib.parse.parse_qsl(body.decode("utf-8")))
         path = parts.path
         org.requests.append((method, path, params))
+        org.request_lines.append(self.requestline)
         if path.endswith("/generateToken"):
             ok = (params.get("username") == _STUB_USER
                   and params.get("password") == _STUB_PASSWORD)
             self._send(200, {"token": _STUB_TOKEN} if ok else
                        {"error": {"code": 400, "message": "Invalid username or password."}})
             return
-        if params.get("token") != _STUB_TOKEN:
+        if self.headers.get("X-Esri-Authorization") != "Bearer " + _STUB_TOKEN:
             self._send(200, {"error": {"code": 498, "message": "Invalid token."}})
             return
         fault = org.pop_fault(path)
@@ -1563,12 +1586,9 @@ class _StubCon(object):
         return self._send(url, {}, params, True, files)
 
     def _send(self, url, query, form, try_json, files=None, want_resp=False):
-        query = dict(query)
-        if self.token:
-            query["token"] = self.token
         full = url + "?" + urllib.parse.urlencode(query)
         body = None if form is None else urllib.parse.urlencode(form).encode("ascii")
-        headers = {}
+        headers = {"X-Esri-Authorization": "Bearer " + self.token} if self.token else {}
         if files:
             boundary = "stubboundary7731"
             parts = [('Content-Disposition: form-data; name="%s"' % k, str(v).encode("utf-8"))
@@ -1587,9 +1607,12 @@ class _StubCon(object):
             data, status, reason = exc.read(), exc.code, exc.reason
             exc.close()
             if not want_resp:
-                # requests puts the full URL, token included, in its HTTPError text.
+                # An older library sends the token in the query and puts the full URL,
+                # token included, in its HTTPError text. The stub reproduces that text
+                # so the redaction pins stay live. The request itself carries a header.
+                shown = full + ("&token=" + self.token if self.token else "")
                 raise RuntimeError("%d Server Error: %s for url: %s"
-                                   % (status, reason, full))
+                                   % (status, reason, shown))
         if want_resp:
             return _StubResp(status, data, reason)
         raw = data.decode("utf-8")
@@ -2720,6 +2743,30 @@ def _scenario_secrets(cli, h):
     check(_STUB_TOKEN not in blob,
           "no token appears in any output file, the backups included, or on the console" + PIN)
     check(len(files) >= 5, "the grep covered the log, the report and the backups")
+    check(len(cli.org.request_lines) > 10
+          and not any("token=" in line.lower() for line in cli.org.request_lines),
+          "no request line holds token=: the token travels in the X-Esri-Authorization header" + PIN)
+    probe = _StubCon()
+    query = {"q": "x", "start": 1, "num": 1}
+    probe.token = _STUB_TOKEN
+    resp = probe.get(cli.url + "/sharing/rest/search", query)
+    probe.token = None
+    resp2 = probe.get(cli.url + "/sharing/rest/search", dict(query, token=_STUB_TOKEN))
+    check("error" not in resp and resp2["error"]["code"] == 498,
+          "the stub accepts the header and refuses a token that is only in the query string")
+    hostile = "ok\x1b[2K\rFAKE" + chr(0x202e) + chr(0x200b) + "\x07"
+    cli.org.items["k4"] = _item(hostile, _webmap(_OLD + "/7"), owner="ow\x1bner")
+    out_dir2 = cli.out_dir()
+    r2 = cli.run(cli.base(["-v"], out_dir=out_dir2))
+    blob2 = r2.out + r2.err + "".join(t for p, t in _tree_text(out_dir2))
+    check(not any(c in blob2 for c in ("\x1b", "\x07", "\rFAKE", chr(0x202e), chr(0x200b)))
+          and "ok [2K" in blob2 and "FAKE" in blob2,
+          "a title with ESC, a bell, CR, a bidi override and a zero-width character reaches no output clean" + PIN)
+    plain = "Caf" + chr(0xe9) + " " + chr(0x65e5) + " " + chr(0x2013) + " 100% (v2) 'x'"
+    check(scrub_text(plain) == plain
+          and scrub_text(7) == 7 and scrub_text("a\nb", keep="\n") == "a\nb"
+          and scrub_text("a\nb") == "a b",
+          "scrub_text leaves ordinary text, non-ASCII included, unchanged")
     backup = dict(files).get("backups/k2.json", "")
     check(json.loads(backup)["operationalLayers"][0]["url"] == _OLD + "/1?token=[redacted]",
           "a backup holds the original data with the token value blanked" + PIN)
