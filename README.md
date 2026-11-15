@@ -337,7 +337,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 - A mistyped flag such as `--pass SECRET` prints `error: unrecognized arguments: --pass [hidden]`. The tool hides the value of an unrecognised argument. It keeps the option name, so you see what you mistyped.
 - The apostrophe prefix stops a formula on first open. OWASP warns it is not reliable in Excel after the file is saved and re-opened.
 - `changes.csv` is UTF-8 without a byte order mark, so Excel on Windows can show non-ASCII titles as garbled text. This is observed Excel behaviour, not something the self-test exercises. Open it with Data > From Text and choose UTF-8 as the file origin. Microsoft's [Text Import Wizard](https://support.microsoft.com/en-us/office/text-import-wizard-c5b02af6-fda1-4440-899f-f78bafe41857) page says only "Select the character set that's used in the text file" and names no UTF-8 value.
-- The tool replaces a control character in a title, owner or URL with a space, and drops zero-width and bidi characters, in the console, `run.log` and `changes.csv`. `changes.csv` keeps tab, carriage return and newline, which its CSV quoting holds inside one cell. Other Unicode tricks, such as look-alike letters, are not touched.
+- The tool replaces a control character in a title, owner or URL with a space, and drops zero-width and bidi characters, in the console, `run.log` and `changes.csv`. `changes.csv` keeps tab, carriage return and newline, which its CSV quoting holds inside one cell. The same scrub runs on every log record after it is formatted (an exception text in a log argument included) and on the sign-in failure text. Other Unicode tricks are not touched: look-alike letters, the bidi marks U+200E, U+200F and U+061C, U+2060, U+00AD, U+180E, U+2062 and tag characters.
 - The stub in the self-test sends the sign-in token in the `X-Esri-Authorization: Bearer` header and never in the query string, and the self-test pins that no request line holds `token=`. The tool itself leaves token handling to the `arcgis` library. A header token needs ArcGIS Server 10.5.1 or later; an older server only accepts the token in the query string.
 - On a Windows console that uses cp1252, a title with characters outside cp1252 makes the logger print a `--- Logging error ---` block and drop that one console line. The run still finishes. `run.log` and `changes.csv` are complete. Set `PYTHONUTF8=1` for non-Latin titles.
 - A search that returns zero items logs `scanned 0 items` and exits 3, because nothing was checked. A mistyped `--types` such as `Storymap` gives this. A typo beside a valid name, as in `Web Map,Storymap`, returns items for the valid name only. The run then logs `--types Storymap returned no item` and exits 3. The tool cannot tell a typo from a type the organization has no item of, so it reports both: take such a name out of `--types`. A scan cut short by `--max-items` reports the cut and names no type.
@@ -427,7 +427,7 @@ the total, so the run exits 0 when everything it could see is clean. Every run p
 
 ## Testing
 
-`--self-test` runs 389 assertions. It starts a stub organization behind a real HTTP server on
+`--self-test` runs 391 assertions. It starts a stub organization behind a real HTTP server on
 `127.0.0.1` and runs the real `main()` against it, in-process, with a fake `arcgis.gis.GIS`. The stub
 signs in with a username and password, hands out a token, and refuses a request that lacks it.
 It answers search, item data, item update, resource list, resource read and resource update.
@@ -499,7 +499,7 @@ PASS  a raw read asks for the response, so the library saves no file to the temp
 PASS  a 502 with an empty body is an error, not an item with no data  <-- pinned defect
 ...
 --------------------------------------------------------------------
-389 assertions, 0 failed
+391 assertions, 0 failed
 ```
 
 The self-test covers:

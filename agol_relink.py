@@ -961,11 +961,8 @@ class _RedactFilter(logging.Filter):
     """Blank token= values in every record, whichever library wrote it."""
 
     def filter(self, record):
-        if isinstance(record.args, tuple):
-            record.args = tuple(scrub_text(a) for a in record.args)
-        elif isinstance(record.args, dict):
-            record.args = {k: scrub_text(v) for k, v in record.args.items()}
-        record.msg = redact(record.getMessage())
+        # Format first: an exception object in args is only str()-ed here.
+        record.msg = redact(scrub_text(record.getMessage(), keep="\n"))
         record.args = None
         if record.exc_info:
             # A traceback is formatted after the filters run, from exc_info.
@@ -1097,9 +1094,9 @@ def connect(org: str, user: str, pwd: str):
     except Exception as e:
         if isinstance(e, ModuleNotFoundError) and e.name == "arcgis":
             sys.exit(_ARCGIS_MISSING)
-        sys.exit("Importing the arcgis package failed: %s\nIf this runs as a "
-                 "scheduled task, use a Python that has arcgis but not arcpy "
-                 "(see the README)." % redact(str(e)))
+        sys.exit(scrub_text("Importing the arcgis package failed: %s\nIf this runs as a "
+                            "scheduled task, use a Python that has arcgis but not arcpy "
+                            "(see the README)." % redact(str(e)), keep="\n"))
     log.info("connecting to %s as %s ...", org, user)
     # NOTE: no verify_cert=False. Disabling TLS verification would POST these
     # credentials over an unvalidated connection. If you target a Portal with a
@@ -1107,9 +1104,9 @@ def connect(org: str, user: str, pwd: str):
     try:
         gis = GIS(org, user, pwd)
     except Exception as e:
-        sys.exit("Could not sign in to %s as %s: %s\nCheck the organization "
-                 "URL, the username and the password."
-                 % (redact(org), user, redact(str(e))))
+        sys.exit(scrub_text("Could not sign in to %s as %s: %s\nCheck the organization "
+                            "URL, the username and the password."
+                            % (redact(org), user, redact(str(e))), keep="\n"))
     log.info("connected as %s (role=%s, org=%s)",
              gis.users.me.username, gis.users.me.role, gis.properties.id)
     return gis
@@ -3151,6 +3148,35 @@ def _selftest_units(h, tmp):
     rec = logging.LogRecord("x", logging.INFO, "f", 1, "u %s", ("a?token=ZZZ",), None)
     check(_RedactFilter().filter(rec) and rec.getMessage() == "u a?token=[redacted]",
           "the log filter blanks a token in a formatted record" + PIN)
+    hostile = "ok\x1b[2K\rFAKE\u202e"
+    rec = logging.LogRecord("x", logging.ERROR, "f", 1, "aborted: %s: %s",
+                            ("ValueError", ValueError(hostile)), None)
+    _RedactFilter().filter(rec)
+    rec2 = logging.LogRecord("x", logging.ERROR, "f", 1, "pre " + hostile, None, None)
+    _RedactFilter().filter(rec2)
+    check(rec.getMessage() == "aborted: ValueError: ok [2K FAKE"
+          and rec2.getMessage() == "pre ok [2K FAKE",
+          "the log filter scrubs an exception object in args and a pre-formatted msg" + PIN)
+    fake_gis = types.ModuleType("arcgis.gis")
+
+    def _failing_gis(*_args):
+        raise RuntimeError(hostile)
+    fake_gis.GIS = _failing_gis
+    saved_mods = {k: sys.modules.get(k) for k in ("arcgis", "arcgis.gis")}
+    sys.modules["arcgis"], sys.modules["arcgis.gis"] = types.ModuleType("arcgis"), fake_gis
+    try:
+        connect("https://o", "u", "p")
+        exit_text = ""
+    except SystemExit as e:
+        exit_text = str(e.code)
+    finally:
+        for k, v in saved_mods.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    check("ok [2K FAKE" in exit_text and not any(c in exit_text for c in "\x1b\r\u202e"),
+          "a sign-in failure text is scrubbed before sys.exit" + PIN)
 
     # the harness itself
     inner = _Harness()
